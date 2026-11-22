@@ -1,0 +1,196 @@
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+static class DesktopFrame
+{
+    const int NotFound = unchecked((int)0x887A0002);
+    static readonly Guid FactoryId = new Guid("7b7166ec-21c7-44ae-b21a-c9ae321ae369");
+    static readonly Guid OutputId = new Guid("00cddea8-939b-4b83-a340-a685226666cc");
+    static readonly Guid TextureId = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+
+    [DllImport("dxgi.dll")] static extern int CreateDXGIFactory1(ref Guid id, out IntPtr factory);
+    [DllImport("d3d11.dll")] static extern int D3D11CreateDevice(IntPtr adapter, int driver, IntPtr software,
+        uint flags, IntPtr levels, uint levelCount, uint sdkVersion, out IntPtr device, out int level, out IntPtr context);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct OutputDescription
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string Name;
+        public int Left, Top, Right, Bottom, Attached, Rotation;
+        public IntPtr Monitor;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct FrameInfo
+    {
+        public long Present, Mouse;
+        public int Frames, Coalesced, Protected, X, Y, PointerVisible, Metadata, PointerSize;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct TextureDescription
+    {
+        public int Width, Height, MipLevels, ArraySize, Format, SampleCount, SampleQuality, Usage, Bind, Access, Misc;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct Mapping { public IntPtr Data; public int RowPitch, DepthPitch; }
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int Enumerate(IntPtr self, uint index, out IntPtr value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int DescribeOutput(IntPtr self, out OutputDescription value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int Duplicate(IntPtr self, IntPtr device, out IntPtr duplication);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int Acquire(IntPtr self, uint timeout, out FrameInfo info, out IntPtr resource);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int ReleaseFrame(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void DescribeTexture(IntPtr self, out TextureDescription description);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateTexture(IntPtr self, ref TextureDescription description, IntPtr initial, out IntPtr texture);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void Copy(IntPtr self, IntPtr destination, IntPtr source);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int Map(IntPtr self, IntPtr texture, uint subresource, int mode, uint flags, out Mapping mapping);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void Unmap(IntPtr self, IntPtr texture, uint subresource);
+
+    static T Method<T>(IntPtr obj, int slot) where T : class
+    {
+        return Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(obj), slot * IntPtr.Size), typeof(T)) as T;
+    }
+    static void Check(int result) { if (result < 0) Marshal.ThrowExceptionForHR(result); }
+    static void Release(IntPtr obj) { if (obj != IntPtr.Zero) Marshal.Release(obj); }
+    static IntPtr Query(IntPtr obj, Guid id)
+    {
+        IntPtr result;
+        Check(Marshal.QueryInterface(obj, ref id, out result));
+        return result;
+    }
+
+    public static Bitmap Capture(Rectangle screen)
+    {
+        var id = FactoryId;
+        IntPtr factory;
+        Check(CreateDXGIFactory1(ref id, out factory));
+        Bitmap bitmap = null;
+        bool captured = false;
+        try
+        {
+            bitmap = new Bitmap(screen.Width, screen.Height, PixelFormat.Format32bppRgb);
+            using (var graphics = Graphics.FromImage(bitmap))
+            {
+                for (uint i = 0; ; i++)
+                {
+                    IntPtr adapter;
+                    int status = Method<Enumerate>(factory, 7)(factory, i, out adapter);
+                    if (status == NotFound) break;
+                    Check(status);
+                    try { captured |= CaptureAdapter(adapter, graphics, screen); }
+                    finally { Release(adapter); }
+                }
+            }
+            if (!captured) throw new InvalidOperationException("No desktop output available.");
+            return bitmap;
+        }
+        catch { if (bitmap != null) bitmap.Dispose(); throw; }
+        finally { Release(factory); }
+    }
+
+    static bool CaptureAdapter(IntPtr adapter, Graphics target, Rectangle screen)
+    {
+        IntPtr device = IntPtr.Zero, context = IntPtr.Zero;
+        bool captured = false;
+        try
+        {
+            for (uint i = 0; ; i++)
+            {
+                IntPtr output;
+                int status = Method<Enumerate>(adapter, 7)(adapter, i, out output);
+                if (status == NotFound) break;
+                Check(status);
+                try
+                {
+                    OutputDescription description;
+                    Check(Method<DescribeOutput>(output, 7)(output, out description));
+                    var bounds = Rectangle.FromLTRB(description.Left, description.Top, description.Right, description.Bottom);
+                    if (description.Attached == 0 || !bounds.IntersectsWith(screen)) continue;
+                    if (device == IntPtr.Zero)
+                    {
+                        int level;
+                        Check(D3D11CreateDevice(adapter, 0, IntPtr.Zero, 0, IntPtr.Zero, 0, 7, out device, out level, out context));
+                    }
+                    using (var image = CaptureOutput(output, device, context))
+                    {
+                        switch (description.Rotation)
+                        {
+                            case 2: image.RotateFlip(RotateFlipType.Rotate90FlipNone); break;
+                            case 3: image.RotateFlip(RotateFlipType.Rotate180FlipNone); break;
+                            case 4: image.RotateFlip(RotateFlipType.Rotate270FlipNone); break;
+                        }
+                        if (image.Size != bounds.Size) throw new InvalidOperationException("Desktop output size changed during capture.");
+                        target.DrawImageUnscaled(image, bounds.X - screen.X, bounds.Y - screen.Y);
+                    }
+                    captured = true;
+                }
+                finally { Release(output); }
+            }
+            return captured;
+        }
+        finally { Release(context); Release(device); }
+    }
+
+    static Bitmap CaptureOutput(IntPtr output, IntPtr device, IntPtr context)
+    {
+        var output1 = Query(output, OutputId);
+        IntPtr duplication = IntPtr.Zero;
+        try
+        {
+            Check(Method<Duplicate>(output1, 22)(output1, device, out duplication));
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                FrameInfo info;
+                IntPtr resource;
+                Check(Method<Acquire>(duplication, 8)(duplication, 180, out info, out resource));
+                try { if (info.Present != 0) return ReadFrame(resource, device, context); }
+                finally { Release(resource); Method<ReleaseFrame>(duplication, 14)(duplication); }
+            }
+            throw new InvalidOperationException("Desktop duplication delivered only pointer updates.");
+        }
+        finally { Release(duplication); Release(output1); }
+    }
+
+    static Bitmap ReadFrame(IntPtr resource, IntPtr device, IntPtr context)
+    {
+        var source = Query(resource, TextureId);
+        IntPtr staging = IntPtr.Zero;
+        try
+        {
+            TextureDescription description;
+            Method<DescribeTexture>(source, 10)(source, out description);
+            if (description.Format != 87) throw new InvalidOperationException("Unexpected desktop pixel format.");
+            description.Usage = 3;
+            description.Bind = 0;
+            description.Access = 0x20000;
+            description.Misc = 0;
+            Check(Method<CreateTexture>(device, 5)(device, ref description, IntPtr.Zero, out staging));
+            Method<Copy>(context, 47)(context, staging, source);
+            Mapping mapped;
+            Check(Method<Map>(context, 14)(context, staging, 0, 1, 0, out mapped));
+            try { return CopyPixels(mapped, description.Width, description.Height); }
+            finally { Method<Unmap>(context, 15)(context, staging, 0); }
+        }
+        finally { Release(staging); Release(source); }
+    }
+
+    static Bitmap CopyPixels(Mapping mapped, int width, int height)
+    {
+        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppRgb);
+        try
+        {
+            var data = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, bitmap.PixelFormat);
+            try
+            {
+                var row = new byte[checked(width * 4)];
+                for (int y = 0; y < height; y++)
+                {
+                    Marshal.Copy(IntPtr.Add(mapped.Data, y * mapped.RowPitch), row, 0, row.Length);
+                    Marshal.Copy(row, 0, IntPtr.Add(data.Scan0, y * data.Stride), row.Length);
+                }
+            }
+            finally { bitmap.UnlockBits(data); }
+            return bitmap;
+        }
+        catch { bitmap.Dispose(); throw; }
+    }
+}

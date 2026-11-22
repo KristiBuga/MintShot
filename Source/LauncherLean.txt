@@ -1,0 +1,200 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+class HintWindow:Form {
+ [DllImport("user32.dll")]static extern bool SetWindowPos(IntPtr h,IntPtr after,int x,int y,int cx,int cy,uint flags);
+ public HintWindow(){AutoScaleMode=AutoScaleMode.None;FormBorderStyle=FormBorderStyle.None;ShowInTaskbar=false;StartPosition=FormStartPosition.Manual;Font=new Font("Segoe UI",10);BackColor=Color.FromArgb(17,22,20);DoubleBuffered=true;var size=TextRenderer.MeasureText("Выберите область",Font,Size.Empty,TextFormatFlags.NoPadding);ClientSize=new Size(size.Width+18,size.Height+10);Opacity=0.99;using(var path=new System.Drawing.Drawing2D.GraphicsPath()){QuickAccessOverlay.AddRounded(path,ClientRectangle,10);Region=new Region(path);}}
+ public void MoveHint(Point p){if(Location==p)return;if(IsHandleCreated)SetWindowPos(Handle,IntPtr.Zero,p.X,p.Y,0,0,0x0015);else Location=p;}
+ protected override void OnPaint(PaintEventArgs e){e.Graphics.Clear(BackColor);TextRenderer.DrawText(e.Graphics,"Выберите область",Font,ClientRectangle,Color.White,TextFormatFlags.NoPadding|TextFormatFlags.HorizontalCenter|TextFormatFlags.VerticalCenter);}
+ protected override bool ShowWithoutActivation{get{return true;}}
+ protected override CreateParams CreateParams{get{var p=base.CreateParams;p.ExStyle|=0x08000000|0x80|0x20;return p;}}
+ protected override void WndProc(ref Message m){if(m.Msg==0x84){m.Result=new IntPtr(-1);return;}base.WndProc(ref m);}
+}
+class OverlayMouse:NativeWindow,IDisposable,IMessageFilter {
+ readonly Form form;readonly Action<Point,int> move;readonly FastOverlay painter;readonly FrameClock clock;readonly InlineText inlineText;readonly QuickAccessOverlay access;
+ readonly EditorHistory history;
+ readonly PenStabilizer stabilizer;
+ readonly FieldInfo selection, originalSelection, selected, mode;
+ public OverlayMouse(Form f,Action<Point,int> handler)
+ {
+  form = f;
+  move = handler;
+  var type = f.GetType();
+  const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic;
+  selection = type.GetField("selection", fields);
+  originalSelection = type.GetField("original", fields);
+  selected = type.GetField("selected", fields);
+  mode = type.GetField("mode", fields);
+  painter = new FastOverlay(f);
+  stabilizer = new PenStabilizer(f);
+  history = new EditorHistory(f);
+  inlineText = new InlineText(f, delegate { access.SaveSelection(); }, history.Record);
+  access = new QuickAccessOverlay(f, painter, history, delegate { inlineText.Finish(false); });
+  AssignHandle(f.Handle);
+  Application.AddMessageFilter(this);
+  clock = new FrameClock(f.Handle);
+  f.Invalidate();
+ }
+ [DllImport("user32.dll")]static extern bool ValidateRect(IntPtr h,IntPtr r);
+ [DllImport("user32.dll")]static extern bool InvalidateRect(IntPtr h,IntPtr r,bool erase);
+ [DllImport("user32.dll")]static extern bool UpdateWindow(IntPtr h);
+ protected override void WndProc(ref Message m)
+ {
+  int msg=m.Msg;
+  if(msg==FrameClock.Message){if(clock.Consume()){InvalidateRect(Handle,IntPtr.Zero,false);UpdateWindow(Handle);}m.Result=IntPtr.Zero;return;}
+  if(msg==0xF){painter.Paint(Handle);m.Result=IntPtr.Zero;return;}
+  if(msg==0x14){m.Result=new IntPtr(1);return;}
+  if (msg == 0x215) stabilizer.Cancel();
+  long value=m.LParam.ToInt64();
+  Point p=new Point((short)(value&65535),(short)((value>>16)&65535));
+  if (painter.IsMovingBlur && HandleBlurMove(ref m, p)) return;
+  if (msg == 0x205 && access.CanOpenCaptureMenu(p))
+  {
+   // WinForms releases the overlay's mouse capture when it handles the button release.
+   base.WndProc(ref m);
+   if (!form.IsDisposed)
+   {
+    inlineText.Finish(false);
+    access.OpenCaptureMenu(p);
+   }
+   return;
+  }
+  if(msg==0x20A&&access.Wheel(form.PointToClient(p),(short)(m.WParam.ToInt64()>>16))){m.Result=IntPtr.Zero;return;}
+  if(msg==0x100&&m.WParam.ToInt32()==(int)Keys.Escape&&access.CloseCircle()){m.Result=IntPtr.Zero;return;}
+  if (msg == 0x100 && HandleHistoryShortcut((Keys)m.WParam.ToInt32(), Control.ModifierKeys))
+  {
+   m.Result = IntPtr.Zero;
+   return;
+  }
+  if (msg == 0x100 && m.WParam.ToInt32() == (int)Keys.A &&
+      Control.ModifierKeys == Keys.Control && !form.Capture)
+  {
+   inlineText.Finish(false);
+   access.SelectWholeScreen();
+   m.Result = IntPtr.Zero;
+   return;
+  }
+  if(msg==0x100&&m.WParam.ToInt32()==(int)Keys.S&&Control.ModifierKeys==Keys.Control){
+   if(!form.Capture){inlineText.Finish(false);access.SaveSelection();}
+   m.Result=IntPtr.Zero;return;
+  }
+  if (msg == 0x100 && painter.RequiresCustomRender &&
+      (m.WParam.ToInt32() == (int)Keys.Enter ||
+       m.WParam.ToInt32() == (int)Keys.C && Control.ModifierKeys == Keys.Control))
+  {
+   if (!form.Capture) access.CopySelection();
+   m.Result = IntPtr.Zero;
+   return;
+  }
+  if(msg==0x201&&inlineText.MouseDown(p)){clock.Request();m.Result=IntPtr.Zero;return;}
+  if (msg == 0x201 && painter.TryStartBlurMove(p))
+  {
+   access.RefreshSlider();
+   clock.Request();
+   m.Result = IntPtr.Zero;
+   return;
+  }
+  bool temporary=false;
+  if(msg==0x201)
+  {
+   bool wasSelected = (bool)selected.GetValue(form);
+   painter.StartAt(p);
+   if (wasSelected && !(bool)selected.GetValue(form)) history.Reset();
+   temporary=painter.DefaultMove(p);
+  }
+  bool movingSelection = msg == 0x202 && (int)mode.GetValue(form) == 2;
+  if (msg == 0x202) stabilizer.Finish(p);
+  base.WndProc(ref m);
+  if(temporary)painter.EndDefaultMove();
+  if(!form.IsDisposed&&(msg==0x200||msg==0x201||msg==0x202)){
+   if (msg == 0x201) painter.InitializeBlur();
+   if (msg == 0x201) stabilizer.Begin(p);
+   if (msg == 0x200) stabilizer.Move(p);
+   if (msg == 0x202)
+   {
+    if (movingSelection)
+    {
+     var before = (Rectangle)originalSelection.GetValue(form);
+     var after = (Rectangle)selection.GetValue(form);
+     history.Translate(after.X - before.X, after.Y - before.Y);
+    }
+    history.Record();
+    access.RefreshSlider();
+   }
+   if (msg == 0x200) painter.UpdateBlurCursor(p);
+   access.Sync();
+   ValidateRect(Handle,IntPtr.Zero);
+   clock.Request();
+   move(form.PointToScreen(p),msg);
+  }
+ }
+ public bool PreFilterMessage(ref Message message)
+ {
+  if (message.Msg != 0x100 || form.IsDisposed || !form.ContainsFocus) return false;
+  var focused = Control.FromHandle(message.HWnd);
+  if (focused is TextBoxBase) return false;
+  return HandleHistoryShortcut((Keys)message.WParam.ToInt32(), Control.ModifierKeys);
+ }
+ bool HandleHistoryShortcut(Keys key, Keys modifiers)
+ {
+  if (modifiers != Keys.Control || (key != Keys.Z && key != Keys.X)) return false;
+  if (!form.Capture) access.ChangeHistory(key == Keys.X);
+  return true;
+ }
+
+ bool HandleBlurMove(ref Message message, Point point)
+ {
+  switch (message.Msg)
+  {
+   case 0x200: // WM_MOUSEMOVE
+   case 0x202: // WM_LBUTTONUP
+    painter.MoveBlur(point);
+    if (message.Msg == 0x202)
+    {
+     painter.EndBlurMove(false);
+     history.Record();
+     painter.UpdateBlurCursor(point);
+    }
+    clock.Request();
+    break;
+   case 0x215: // WM_CAPTURECHANGED
+    painter.EndBlurMove(true);
+    clock.Request();
+    return false;
+   case 0x100: // WM_KEYDOWN
+    if (message.WParam.ToInt32() == (int)Keys.Escape)
+    {
+     painter.EndBlurMove(true);
+     clock.Request();
+    }
+    break;
+   case 0x204: // WM_RBUTTONDOWN
+   case 0x205: // WM_RBUTTONUP
+    break;
+   default:
+    return false;
+  }
+  message.Result = IntPtr.Zero;
+  return true;
+ }
+ public void Dispose(){Application.RemoveMessageFilter(this);clock.Dispose();inlineText.Dispose();access.Dispose();ReleaseHandle();painter.Dispose();}
+}
+static class Launcher {
+ [DllImport("user32.dll")]static extern bool SetProcessDPIAware();
+ static readonly Dictionary<Form,HintWindow> hints=new Dictionary<Form,HintWindow>();
+ static readonly Dictionary<Form,Point> pointers=new Dictionary<Form,Point>();
+ static readonly Dictionary<Form,OverlayMouse> trackers=new Dictionary<Form,OverlayMouse>();
+ static void Update(Form f,HintWindow hint){if(f.IsDisposed||hint.IsDisposed)return;var type=f.GetType();bool selected=(bool)type.GetField("selected",BindingFlags.NonPublic|BindingFlags.Instance).GetValue(f);int mode=(int)type.GetField("mode",BindingFlags.NonPublic|BindingFlags.Instance).GetValue(f);Point mouse;if(!pointers.TryGetValue(f,out mouse))mouse=Cursor.Position;bool show=f.Visible&&!selected&&mode==0&&f.Bounds.Contains(mouse);if(!show){if(hint.Visible)hint.Hide();return;}var screen=Screen.FromPoint(mouse).Bounds;Point next=new Point(Math.Max(screen.Left,Math.Min(screen.Right-hint.Width,mouse.X+15)),Math.Max(screen.Top,Math.Min(screen.Bottom-hint.Height,mouse.Y+23)));hint.MoveHint(next);if(!hint.Visible)hint.Show(f);}
+ [STAThread]static void Main(string[] args){bool created;using(var single=new Mutex(true,"Local\\MintShot.SingleInstance",out created)){if(!created)return;try{Run(args);}finally{single.ReleaseMutex();}}UpdateService.LaunchPending();}
+ static bool scanning;
+ static void ScanForms(object sender,EventArgs e){if(scanning)return;scanning=true;try{
+  var forms=new List<Form>();foreach(Form form in Application.OpenForms){AppBrand.Apply(form);if(form.GetType().Name=="Overlay")forms.Add(form);}
+  foreach(var f in forms){HintWindow hint;if(!hints.TryGetValue(f,out hint)){hint=new HintWindow();hints.Add(f,hint);var captured=hint;trackers[f]=new OverlayMouse(f,delegate(Point point,int message){pointers[f]=point;if(message==0x201)captured.Hide();else Update(f,captured);});f.FormClosed+=delegate{trackers[f].Dispose();trackers.Remove(f);pointers.Remove(f);captured.Dispose();hints.Remove(f);};}Update(f,hint);}
+}finally{scanning=false;}}
+ static void Run(string[] args){SetProcessDPIAware();Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);Application.Idle+=ScanForms;try{using(var resource=Assembly.GetExecutingAssembly().GetManifestResourceStream("MintShot.Payload"))using(var bytes=new MemoryStream()){resource.CopyTo(bytes);var a=Assembly.Load(bytes.ToArray());var preferences=a.GetType("MintShot.Preferences");var current=preferences.GetField("Current").GetValue(null);var notifications=preferences.GetField("Notifications");bool enabled=(bool)notifications.GetValue(current);notifications.SetValue(current,false);EventHandler restore=null;restore=delegate{Application.Idle-=restore;notifications.SetValue(current,enabled);TrayClick.Install(a);};Application.Idle+=restore;try{a.EntryPoint.Invoke(null,new object[]{args});}finally{Application.Idle-=restore;notifications.SetValue(current,enabled);}}}finally{GlobalHotkeys.Shutdown();Application.Idle-=ScanForms;foreach(var tracker in new List<OverlayMouse>(trackers.Values))tracker.Dispose();trackers.Clear();foreach(var hint in new List<HintWindow>(hints.Values))hint.Dispose();hints.Clear();pointers.Clear();}}
+}

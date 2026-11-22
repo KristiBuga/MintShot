@@ -1,0 +1,208 @@
+using System;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+static class CaptureDestination
+{
+    const BindingFlags Private = BindingFlags.Instance | BindingFlags.NonPublic;
+
+    static bool IncludeCursor(Type preferences, object current)
+    {
+        return (bool)preferences.GetField("IncludeCursor").GetValue(current);
+    }
+
+    static Bitmap CaptureScreen(Rectangle screen, bool includeCursor)
+    {
+        var image = new Bitmap(screen.Width, screen.Height);
+        try
+        {
+            using (var graphics = Graphics.FromImage(image))
+            {
+                graphics.CopyFromScreen(screen.Location, Point.Empty, screen.Size);
+                if (includeCursor) DrawCursor(graphics, screen);
+            }
+            return image;
+        }
+        catch
+        {
+            image.Dispose();
+            throw;
+        }
+    }
+
+    public static async void OpenRegion(object context, bool fromTray)
+    {
+        var type = context.GetType();
+        var busy = type.GetField("busy", Private);
+        var settings = type.GetField("settings", Private);
+        if ((bool)busy.GetValue(context) || settings.GetValue(context) != null) return;
+        busy.SetValue(context, true);
+        try
+        {
+            // Let the tray menu disappear before taking the snapshot.
+            if (fromTray) await Task.Delay(120);
+            if (settings.GetValue(context) != null) return;
+            var preferences = type.Assembly.GetType("MintShot.Preferences");
+            var current = preferences.GetField("Current").GetValue(null);
+            var screen = SystemInformation.VirtualScreen;
+            using (var image = await CaptureRegionFrame(screen, IncludeCursor(preferences, current)))
+            using (var overlay = (Form)Activator.CreateInstance(type.Assembly.GetType("MintShot.Overlay"), image, screen))
+                overlay.ShowDialog();
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show((error.InnerException ?? error).Message, "Ошибка захвата");
+        }
+        finally { busy.SetValue(context, false); }
+    }
+
+    static async Task<Bitmap> CaptureRegionFrame(Rectangle screen, bool includeCursor)
+    {
+        if (includeCursor) return CaptureScreen(screen, true);
+
+        try
+        {
+            return await Task.Run(() => CleanRegionFrame(DesktopFrame.Capture(screen)));
+        }
+        catch (ExternalException error)
+        {
+            System.Diagnostics.Trace.WriteLine("Desktop duplication unavailable: " + error.Message);
+        }
+        catch (InvalidOperationException error)
+        {
+            System.Diagnostics.Trace.WriteLine("Desktop duplication unavailable: " + error.Message);
+        }
+        catch (UnauthorizedAccessException error)
+        {
+            System.Diagnostics.Trace.WriteLine("Desktop duplication unavailable: " + error.Message);
+        }
+        return CleanRegionFrame(CaptureScreen(screen, false));
+    }
+
+    static Bitmap CleanRegionFrame(Bitmap frame)
+    {
+        try { CaptureSpecks.Remove(frame); return frame; }
+        catch { frame.Dispose(); throw; }
+    }
+
+    public static void CopyRegion(Form form, Func<Bitmap> render)
+    {
+        var type = form.GetType();
+        if (!(bool)type.GetField("selected", Private).GetValue(form)) return;
+        try
+        {
+            using (var image = render()) Clipboard.SetImage(image);
+            form.Close();
+            var preferences = type.Assembly.GetType("MintShot.Preferences");
+            var notify = (Action<string>)preferences.GetField("Notify").GetValue(null);
+            if (notify != null) notify("Скриншот скопирован");
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show((error.InnerException ?? error).Message, "Не удалось скопировать снимок");
+        }
+    }
+
+    public static void SaveRegion(Form form, Func<Bitmap> render)
+    {
+        var type = form.GetType();
+        if (!(bool)type.GetField("selected", Private).GetValue(form)) return;
+        var preferences = type.Assembly.GetType("MintShot.Preferences");
+        var current = preferences.GetField("Current").GetValue(null);
+        bool jpeg = (string)preferences.GetField("Format").GetValue(current) == "JPEG";
+        try
+        {
+            using (var dialog = new SaveFileDialog {
+                Filter = "PNG|*.png|JPEG|*.jpg", FilterIndex = jpeg ? 2 : 1,
+                DefaultExt = jpeg ? "jpg" : "png", RestoreDirectory = true,
+                FileName = "MintShot-" + DateTime.Now.ToString("yyyy-MM-dd-HHmmss"),
+                InitialDirectory = QuickAccessSettings.Current.Folder
+            })
+            {
+                if (dialog.ShowDialog(form) != DialogResult.OK) return;
+                using (var image = render())
+                    Save(preferences, image, dialog.FileName);
+                form.Close();
+                Notify(preferences, dialog.FileName);
+            }
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show((error.InnerException ?? error).Message, "Не удалось сохранить снимок");
+        }
+    }
+
+    public static bool SaveQuick(object context)
+    {
+        string folder = QuickAccessSettings.Current.Folder;
+        var type = context.GetType();
+        var preferences = type.Assembly.GetType("MintShot.Preferences");
+        var current = preferences.GetField("Current").GetValue(null);
+        try
+        {
+            if (String.IsNullOrEmpty(folder))
+            {
+                folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "MintShot");
+                Directory.CreateDirectory(folder);
+            }
+            else if (!Directory.Exists(folder)) throw new IOException("Папка сохранения недоступна: " + folder);
+            bool jpeg = (string)preferences.GetField("Format").GetValue(current) == "JPEG";
+            var screen = SystemInformation.VirtualScreen;
+            var path = Path.Combine(folder, "MintShot-" + DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + (jpeg ? ".jpg" : ".png"));
+            using (var image = CaptureScreen(screen, IncludeCursor(preferences, current)))
+                Save(preferences, image, path);
+            Notify(preferences, path);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show((error.InnerException ?? error).Message, "Не удалось сохранить снимок");
+        }
+        return true;
+    }
+
+    static void Save(Type preferences, Bitmap image, string path)
+    {
+        preferences.GetMethod("SaveImage").Invoke(null, new object[] { image, path });
+    }
+
+    static void Notify(Type preferences, string path)
+    {
+        var notify = (Action<string>)preferences.GetField("Notify").GetValue(null);
+        if (notify != null) notify("Сохранено: " + path);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CursorInfo { public int Size, Flags; public IntPtr Cursor; public Point Position; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IconInfo { public int Icon, X, Y; public IntPtr Mask, Color; }
+    [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CursorInfo info);
+    [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr cursor, out IconInfo info);
+    [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr dc, int x, int y, IntPtr cursor, int width, int height, int frame, IntPtr brush, int flags);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr bitmap);
+
+    static void DrawCursor(Graphics graphics, Rectangle screen)
+    {
+        var info = new CursorInfo { Size = Marshal.SizeOf(typeof(CursorInfo)) };
+        IconInfo icon;
+        if (!GetCursorInfo(ref info) || (info.Flags & 1) == 0 || !GetIconInfo(info.Cursor, out icon)) return;
+        try
+        {
+            var dc = graphics.GetHdc();
+            try
+            {
+                DrawIconEx(dc, info.Position.X - screen.Left - icon.X, info.Position.Y - screen.Top - icon.Y,
+                    info.Cursor, 0, 0, 0, IntPtr.Zero, 3);
+            }
+            finally { graphics.ReleaseHdc(dc); }
+        }
+        finally
+        {
+            if (icon.Mask != IntPtr.Zero) DeleteObject(icon.Mask);
+            if (icon.Color != IntPtr.Zero) DeleteObject(icon.Color);
+        }
+    }
+}

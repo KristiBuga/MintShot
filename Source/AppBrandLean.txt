@@ -1,0 +1,13 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Windows.Forms;
+static class AppBrand {
+ static readonly HashSet<Form> seen=new HashSet<Form>();
+ public static readonly Icon Icon=LoadIcon();static Image logo;public static Image Logo {get{if(logo==null)logo=LoadLogo();return logo;}}
+ static Icon LoadIcon(){using(var s=Assembly.GetExecutingAssembly().GetManifestResourceStream("MintShot.Icon"))using(var i=new Icon(s))return (Icon)i.Clone();}
+ static Image LoadLogo(){using(var s=Assembly.GetExecutingAssembly().GetManifestResourceStream("MintShot.Logo"))using(var i=Image.FromStream(s))return new Bitmap(i);}
+ public static void Apply(Form form){if(seen.Contains(form))return;seen.Add(form);form.Icon=Icon;form.Disposed+=delegate{seen.Remove(form);};if(form.GetType().Name=="SettingsDialog"){GlobalHotkeys.InstallSettings(form);StartupOption.Install(form);QuickAccessSettings.Install(form);}if(form.GetType().Name=="AboutDialog"){var picture=new PictureBox{Image=Logo,SizeMode=PictureBoxSizeMode.Zoom,Location=new Point(250,20),Size=new Size(130,137)};form.Controls.Add(picture);foreach(Control child in form.Controls)if(child is Label&&System.Text.RegularExpressions.Regex.IsMatch(child.Text.Trim(),@"^\d+\.\d+"))child.Text=Assembly.GetExecutingAssembly().GetName().Version.ToString(3);QuickAccessSettings.PaintTheme(form,QuickAccessSettings.Current.Light);picture.BringToFront();}}
+}

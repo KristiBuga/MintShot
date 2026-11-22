@@ -1,0 +1,64 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+class GlobalHotkeys:IDisposable {
+ const int TriggerMessage=0x8061,AssignMessage=0x8062;
+ const BindingFlags Fields=BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Instance;
+ delegate IntPtr HookProc(int code,IntPtr message,IntPtr data);
+ [StructLayout(LayoutKind.Sequential)]struct KeyEvent {public int Key,Scan,Flags,Time;public IntPtr Extra;}
+ [DllImport("user32.dll",SetLastError=true)]static extern IntPtr SetWindowsHookEx(int id,HookProc callback,IntPtr module,uint thread);
+ [DllImport("user32.dll")]static extern bool UnhookWindowsHookEx(IntPtr hook);
+ [DllImport("user32.dll")]static extern IntPtr CallNextHookEx(IntPtr hook,int code,IntPtr message,IntPtr data);
+ [DllImport("user32.dll")]static extern short GetAsyncKeyState(int key);
+ [DllImport("user32.dll")]static extern bool PostMessage(IntPtr window,int message,IntPtr w,IntPtr l);
+ [DllImport("user32.dll")]static extern bool UnregisterHotKey(IntPtr window,int id);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode)]static extern IntPtr GetModuleHandle(string name);
+ class Receiver:NativeWindow {readonly GlobalHotkeys owner;public Receiver(GlobalHotkeys controller){owner=controller;CreateHandle(new CreateParams{Parent=new IntPtr(-3)});}protected override void WndProc(ref Message m){if(m.Msg==TriggerMessage){owner.Trigger(m.WParam.ToInt32());m.Result=IntPtr.Zero;return;}if(m.Msg==AssignMessage){owner.Assign(m.WParam.ToInt32());m.Result=IntPtr.Zero;return;}base.WndProc(ref m);}}
+ public static GlobalHotkeys Current;
+ readonly object context;readonly Type preferences;readonly FieldInfo settings,busy;readonly MethodInfo capture;readonly HookProc callback;readonly Receiver receiver;readonly HashSet<int> down=new HashSet<int>(),handled=new HashSet<int>();IntPtr hook;int mainKey,quickKey;bool mainEnabled,quickEnabled,disposed;
+ public bool Active {get{return hook!=IntPtr.Zero;}}
+ public GlobalHotkeys(object trayContext,Type preferencesType){context=trayContext;preferences=preferencesType;settings=context.GetType().GetField("settings",Fields);busy=context.GetType().GetField("busy",Fields);capture=context.GetType().GetMethod("Capture",Fields);callback=Hook;receiver=new Receiver(this);Configure(preferences.GetField("Current").GetValue(null));}
+ public static void Install(object context){if(Current!=null)Current.Dispose();var type=context.GetType().Assembly.GetType("MintShot.Preferences");if(type==null)return;var controller=new GlobalHotkeys(context,type);if(!controller.Start()){controller.Dispose();return;}Current=controller;}
+ public static void Shutdown(){if(Current!=null){Current.Dispose();Current=null;}}
+ public bool Start(){if(Active)return true;hook=SetWindowsHookEx(13,callback,GetModuleHandle(null),0);if(hook==IntPtr.Zero)return false;StopLegacy();return true;}
+ void StopLegacy(){var fallback=context.GetType().GetField("fallback",Fields);if(fallback!=null){var old=fallback.GetValue(context) as IDisposable;if(old!=null)old.Dispose();}var field=context.GetType().GetField("receiver",Fields);if(field!=null){var old=field.GetValue(context) as NativeWindow;if(old!=null){UnregisterHotKey(old.Handle,1);UnregisterHotKey(old.Handle,2);}}}
+ public void Configure(object value){mainKey=(int)preferences.GetField("MainKey").GetValue(value);quickKey=(int)preferences.GetField("QuickKey").GetValue(value);mainEnabled=(bool)preferences.GetField("MainEnabled").GetValue(value);quickEnabled=(bool)preferences.GetField("QuickEnabled").GetValue(value);down.Clear();handled.Clear();}
+ static bool Valid(int value){Keys key=(Keys)(value&0xFFFF);return key>Keys.None&&key<=(Keys)254&&key!=Keys.ControlKey&&key!=Keys.ShiftKey&&key!=Keys.Menu&&key!=Keys.LControlKey&&key!=Keys.RControlKey&&key!=Keys.LShiftKey&&key!=Keys.RShiftKey&&key!=Keys.LMenu&&key!=Keys.RMenu&&key!=Keys.LWin&&key!=Keys.RWin&&key!=Keys.Escape&&key!=Keys.Enter&&key!=Keys.Tab;}
+ Form Settings {get{return settings==null?null:settings.GetValue(context) as Form;}}
+ TextBox FocusedKeyBox(out int index){
+  index=-1;
+  var form=Settings;
+  if(form==null||form.IsDisposed||form.Controls.Count==0)return null;
+  var page=MintSettingsLayout.Page(form,1);
+  if(page==null)return null;
+  int legacyIndex=0;
+  foreach(Control control in page.Controls){
+   var field=control as MintShortcutField;
+   if(field!=null&&field.Editor.Focused){index=field.Index;return field.Editor;}
+   var legacy=control as TextBox;
+   if(legacy==null)continue;
+   if(legacy.Focused){index=legacyIndex;return legacy;}
+   legacyIndex++;
+  }
+  return null;
+ }
+ IntPtr Hook(int code,IntPtr message,IntPtr data){if(code>=0&&!disposed){int msg=message.ToInt32();if(msg==0x100||msg==0x104||msg==0x101||msg==0x105){var key=(KeyEvent)Marshal.PtrToStructure(data,typeof(KeyEvent));int modifiers=0;if(GetAsyncKeyState(0x10)<0)modifiers|=(int)Keys.Shift;if(GetAsyncKeyState(0x11)<0)modifiers|=(int)Keys.Control;if(GetAsyncKeyState(0x12)<0||(key.Flags&0x20)!=0)modifiers|=(int)Keys.Alt;
+   // Drivers and accessibility tools may mark genuine configured shortcuts as injected.
+   // No events are generated here: matched keys are only routed to our own window.
+   if(Route(key.Key,modifiers,msg==0x100||msg==0x104))return new IntPtr(1);
+  }}return CallNextHookEx(hook,code,message,data);}
+ public bool Route(int key,int modifiers,bool isDown){int value=key|modifiers;int focusedIndex;bool configuring=FocusedKeyBox(out focusedIndex)!=null;if(configuring&&Valid(value)){if(isDown){if(down.Add(key))PostMessage(receiver.Handle,AssignMessage,new IntPtr(value),IntPtr.Zero);handled.Add(key);}else{bool saw=down.Remove(key);handled.Remove(key);if(!saw)PostMessage(receiver.Handle,AssignMessage,new IntPtr(value),IntPtr.Zero);}return true;}
+  bool target=(mainEnabled&&(mainKey&0xFFFF)==key)||(quickEnabled&&(quickKey&0xFFFF)==key);if(!target&&!handled.Contains(key))return false;
+  if(isDown){bool first=down.Add(key);if(handled.Contains(key))return true;int id=Match(value);if(id==0)return false;handled.Add(key);if(first)PostMessage(receiver.Handle,TriggerMessage,new IntPtr(id),IntPtr.Zero);return true;}
+  bool wasDown=down.Remove(key);if(handled.Remove(key))return true;if(!wasDown){int id=Match(value);if(id!=0){PostMessage(receiver.Handle,TriggerMessage,new IntPtr(id),IntPtr.Zero);return true;}}return false;
+ }
+ int Match(int value){if(mainEnabled&&value==mainKey)return 1;if(quickEnabled&&value==quickKey)return 2;return 0;}
+ void Trigger(int id){if(disposed||Settings!=null)return;if(busy!=null&&(bool)busy.GetValue(context))return;if(id==2){CaptureDestination.SaveQuick(context);return;}CaptureDestination.OpenRegion(context,false);}
+ void Assign(int value){int index;var box=FocusedKeyBox(out index);var form=Settings;if(box==null||form==null||!Valid(value))return;var draft=form.GetType().GetField("draft",Fields).GetValue(form);preferences.GetField(index==0?"MainKey":"QuickKey").SetValue(draft,value);box.Text=Display(value);}
+ static string Display(int value){Keys k=(Keys)value;return ((k&Keys.Control)!=0?"Ctrl + ":"")+((k&Keys.Shift)!=0?"Shift + ":"")+((k&Keys.Alt)!=0?"Alt + ":"")+((k&Keys.KeyCode)==Keys.PrintScreen?"Prt Scr":(k&Keys.KeyCode).ToString());}
+ public static void InstallSettings(Form form){if(Current==null||!Current.Active)return;var apply=form.GetType().GetField("Apply");var type=apply.FieldType.GetGenericArguments()[0];var wrap=typeof(GlobalHotkeys).GetMethod("ApplyDelegate",BindingFlags.Public|BindingFlags.Static).MakeGenericMethod(type);apply.SetValue(form,wrap.Invoke(null,new object[]{form}));var tabs=form.Controls[0] as TabControl;if(tabs!=null)foreach(Control control in tabs.TabPages[1].Controls)if(control is Label)control.Text="Выберите поле и нажмите нужное сочетание.\nЗатем нажмите «Сохранить».";}
+ public static Func<T,bool> ApplyDelegate<T>(Form form){return delegate(T value){var self=Current;if(self==null||!self.Active)return false;int main=(int)self.preferences.GetField("MainKey").GetValue(value),quick=(int)self.preferences.GetField("QuickKey").GetValue(value);bool enableMain=(bool)self.preferences.GetField("MainEnabled").GetValue(value),enableQuick=(bool)self.preferences.GetField("QuickEnabled").GetValue(value);if((enableMain&&!Valid(main))||(enableQuick&&!Valid(quick))||(enableMain&&enableQuick&&main==quick)){MessageBox.Show(form,"Выберите допустимые и разные сочетания для двух действий.","Горячие клавиши");return false;}try{self.preferences.GetMethod("Save").Invoke(value,null);self.preferences.GetField("Current").SetValue(null,value);self.Configure(value);self.StopLegacy();return true;}catch(Exception ex){MessageBox.Show(form,(ex.InnerException??ex).Message,"Не удалось сохранить настройки");return false;}};}
+ public void Dispose(){if(disposed)return;disposed=true;if(hook!=IntPtr.Zero)UnhookWindowsHookEx(hook);hook=IntPtr.Zero;receiver.DestroyHandle();}
+}

@@ -1,0 +1,166 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+
+sealed class EditorHistory
+{
+    const BindingFlags Fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+    readonly IList marks;
+    readonly FieldInfo tool, text, color, width, start, end, points;
+    readonly Stack<MarkState[]> undo = new Stack<MarkState[]>();
+    readonly Stack<MarkState[]> redo = new Stack<MarkState[]>();
+    MarkState[] current;
+    Point offset;
+
+    public EditorHistory(Form editor)
+    {
+        var editorType = editor.GetType();
+        marks = (IList)editorType.GetField("marks", Fields).GetValue(editor);
+        var markType = editorType.GetField("active", Fields).FieldType;
+        tool = markType.GetField("Tool", Fields);
+        text = markType.GetField("Text", Fields);
+        color = markType.GetField("Color", Fields);
+        width = markType.GetField("Width", Fields);
+        start = markType.GetField("A", Fields);
+        end = markType.GetField("B", Fields);
+        points = markType.GetField("Points", Fields);
+        current = Capture();
+    }
+
+    public void Record()
+    {
+        var next = Capture();
+        if (Object.ReferenceEquals(next, current)) return;
+        undo.Push(current);
+        current = next;
+        redo.Clear();
+    }
+
+    public bool Undo()
+    {
+        Record();
+        if (undo.Count == 0) return false;
+        redo.Push(current);
+        Restore(undo.Pop());
+        return true;
+    }
+
+    public bool Redo()
+    {
+        Record();
+        if (redo.Count == 0) return false;
+        undo.Push(current);
+        Restore(redo.Pop());
+        return true;
+    }
+
+    public void Reset()
+    {
+        undo.Clear();
+        redo.Clear();
+        offset = Point.Empty;
+        current = null;
+        current = Capture();
+    }
+
+    public void Translate(int dx, int dy)
+    {
+        offset.Offset(dx, dy);
+    }
+
+    MarkState[] Capture()
+    {
+        int count = marks.Count;
+        MarkState[] next = current != null && current.Length == count ? null : new MarkState[count];
+        for (int i = 0; i < count; i++)
+        {
+            var previous = current != null && i < current.Length ? current[i] : null;
+            object mark = marks[i];
+            var state = previous != null && previous.Matches(this, mark) ? previous : new MarkState(this, mark);
+            if (next == null && state != previous)
+            {
+                next = new MarkState[count];
+                Array.Copy(current, next, i);
+            }
+            if (next != null) next[i] = state;
+        }
+        return next ?? current;
+    }
+
+    void Restore(MarkState[] snapshot)
+    {
+        marks.Clear();
+        foreach (var state in snapshot)
+        {
+            state.Restore(this);
+            marks.Add(state.Mark);
+        }
+        current = snapshot;
+    }
+
+    Point Relative(Point point) { return new Point(point.X - offset.X, point.Y - offset.Y); }
+    Point Absolute(Point point) { return new Point(point.X + offset.X, point.Y + offset.Y); }
+
+    sealed class MarkState
+    {
+        public readonly object Mark;
+        readonly string tool, text;
+        readonly Color color;
+        readonly int width;
+        readonly Point start, end;
+        readonly Point[] points;
+
+        public MarkState(EditorHistory owner, object mark)
+        {
+            Mark = mark;
+            tool = (string)owner.tool.GetValue(mark);
+            text = (string)owner.text.GetValue(mark);
+            color = (Color)owner.color.GetValue(mark);
+            width = (int)owner.width.GetValue(mark);
+            start = owner.Relative((Point)owner.start.GetValue(mark));
+            end = owner.Relative((Point)owner.end.GetValue(mark));
+            var path = (List<Point>)owner.points.GetValue(mark);
+            if (path == null) return;
+            points = new Point[path.Count];
+            for (int i = 0; i < path.Count; i++) points[i] = owner.Relative(path[i]);
+        }
+
+        public bool Matches(EditorHistory owner, object mark)
+        {
+            if (!Object.ReferenceEquals(Mark, mark) ||
+                tool != (string)owner.tool.GetValue(mark) ||
+                text != (string)owner.text.GetValue(mark) ||
+                color != (Color)owner.color.GetValue(mark) ||
+                width != (int)owner.width.GetValue(mark) ||
+                start != owner.Relative((Point)owner.start.GetValue(mark)) ||
+                end != owner.Relative((Point)owner.end.GetValue(mark))) return false;
+
+            var path = (List<Point>)owner.points.GetValue(mark);
+            if (path == null || points == null) return path == null && points == null;
+            if (path.Count != points.Length) return false;
+            for (int i = 0; i < points.Length; i++)
+                if (points[i] != owner.Relative(path[i])) return false;
+            return true;
+        }
+
+        public void Restore(EditorHistory owner)
+        {
+            owner.tool.SetValue(Mark, tool);
+            owner.text.SetValue(Mark, text);
+            owner.color.SetValue(Mark, color);
+            owner.width.SetValue(Mark, width);
+            owner.start.SetValue(Mark, owner.Absolute(start));
+            owner.end.SetValue(Mark, owner.Absolute(end));
+            List<Point> path = null;
+            if (points != null)
+            {
+                path = new List<Point>(points.Length);
+                foreach (var point in points) path.Add(owner.Absolute(point));
+            }
+            owner.points.SetValue(Mark, path);
+        }
+    }
+}

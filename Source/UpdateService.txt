@@ -1,0 +1,218 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+sealed class UpdateService
+{
+    const string Repo = "KristiBuga/MintShot";
+    const int MaximumInstallerBytes = 32 * 1024 * 1024;
+    static string pendingInstaller;
+    readonly ApplicationContext context;
+    readonly ToolStripItem menu;
+    readonly Func<bool> busy;
+    bool checking;
+
+    public sealed class Release
+    {
+        public string tag_name { get; set; }
+        public bool draft { get; set; }
+        public bool prerelease { get; set; }
+        public Asset[] assets { get; set; }
+    }
+
+    public sealed class Asset
+    {
+        public string name { get; set; }
+        public string digest { get; set; }
+        public string browser_download_url { get; set; }
+        public int size { get; set; }
+    }
+
+    public UpdateService(ApplicationContext context, ContextMenuStrip trayMenu, Func<bool> busy)
+    {
+        this.context = context;
+        this.busy = busy;
+        menu = new ToolStripMenuItem("Проверить обновления…");
+        trayMenu.Items.Insert(trayMenu.Items.Count - 1, menu);
+        menu.Click += delegate { Check(true); };
+        var startup = new Timer { Interval = 12000 };
+        startup.Tick += delegate { startup.Stop(); startup.Dispose(); Check(false); };
+        context.ThreadExit += delegate { startup.Dispose(); };
+        startup.Start();
+    }
+
+    async void Check(bool manual)
+    {
+        if (checking || busy()) return;
+        checking = true;
+        menu.Enabled = false;
+        try
+        {
+            var asset = await Task.Run(new Func<Asset>(LatestInstaller));
+            if (busy()) return;
+            if (asset == null)
+            {
+                if (manual) MessageBox.Show("У вас уже установлена актуальная версия.", "MintShot");
+                return;
+            }
+            var choice = MessageBox.Show("Доступна новая версия MintShot. Скачать и установить её?",
+                "Обновление MintShot", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (choice != DialogResult.Yes) return;
+            var downloaded = await Task.Run(delegate { return Download(asset); });
+            if (busy())
+            {
+                File.Delete(downloaded);
+                MessageBox.Show("Завершите захват или закройте настройки и повторите проверку.", "MintShot");
+                return;
+            }
+            pendingInstaller = downloaded;
+            context.ExitThread();
+        }
+        catch (Exception error)
+        {
+            if (manual) MessageBox.Show(error.Message, "Не удалось обновить MintShot");
+        }
+        finally
+        {
+            checking = false;
+            if (!menu.IsDisposed) menu.Enabled = true;
+        }
+    }
+
+    static Asset LatestInstaller()
+    {
+        var url = new Uri("https://api.github.com/repos/" + Repo + "/releases/latest");
+        string json;
+        using (var response = Open(url, false))
+        using (var stream = new MemoryStream())
+        {
+            Transfer(response, stream, 512 * 1024);
+            json = System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+        return ParseRelease(json, Assembly.GetExecutingAssembly().GetName().Version);
+    }
+
+    public static Asset ParseRelease(string json, Version current)
+    {
+        var release = new JavaScriptSerializer { MaxJsonLength = 512 * 1024 }.Deserialize<Release>(json);
+        if (release == null || release.draft || release.prerelease) return null;
+        if (!Regex.IsMatch(release.tag_name ?? "", @"\Av\d+\.\d+\.\d+\z"))
+            throw new InvalidDataException("Номер версии в GitHub Releases не распознан.");
+        var version = new Version(release.tag_name.Substring(1) + ".0");
+        if (version <= current) return null;
+        string name = "MintShotSetup-" + version.ToString(3) + ".exe";
+        string url = "https://github.com/" + Repo + "/releases/download/" + release.tag_name + "/" + name;
+        var asset = (release.assets ?? new Asset[0]).FirstOrDefault(item =>
+            item != null && item.name == name && item.browser_download_url == url);
+        if (asset == null || asset.size <= 0 || asset.size > MaximumInstallerBytes ||
+            !Regex.IsMatch(asset.digest ?? "", @"\Asha256:[0-9a-fA-F]{64}\z"))
+            throw new InvalidDataException("В релизе нет установщика с контрольной суммой SHA-256.");
+        return asset;
+    }
+
+    static HttpWebResponse Open(Uri url, bool installer)
+    {
+        for (int redirects = 0; redirects < 4; redirects++)
+        {
+            bool hostAllowed = installer
+                ? url.Host == "github.com" || url.Host == "release-assets.githubusercontent.com" || url.Host == "objects.githubusercontent.com"
+                : url.Host == "api.github.com";
+            if (url.Scheme != Uri.UriSchemeHttps || !url.IsDefaultPort || url.UserInfo.Length != 0 || !hostAllowed)
+                throw new InvalidDataException("GitHub перенаправил запрос на неизвестный адрес.");
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.UserAgent = "MintShot";
+            request.Accept = installer ? "application/octet-stream" : "application/vnd.github+json";
+            request.Timeout = 12000;
+            request.ReadWriteTimeout = 12000;
+            request.AllowAutoRedirect = false;
+            var response = (HttpWebResponse)request.GetResponse();
+            if (response.StatusCode == HttpStatusCode.OK) return response;
+            using (response)
+            {
+                var location = response.Headers["Location"];
+                if (!installer || String.IsNullOrEmpty(location) || (int)response.StatusCode < 300 || (int)response.StatusCode >= 400)
+                    throw new IOException("GitHub не вернул файл обновления.");
+                url = new Uri(url, location);
+            }
+        }
+        throw new IOException("Слишком много перенаправлений при загрузке.");
+    }
+
+    static void Transfer(HttpWebResponse response, Stream destination, int maximumBytes)
+    {
+        if (response.ContentLength > maximumBytes) throw new InvalidDataException("Файл обновления слишком большой.");
+        using (var input = response.GetResponseStream())
+        {
+            var buffer = new byte[32768];
+            int count;
+            while ((count = input.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                if (destination.Length + count > maximumBytes) throw new InvalidDataException("Файл обновления слишком большой.");
+                destination.Write(buffer, 0, count);
+            }
+        }
+    }
+
+    static string Download(Asset asset)
+    {
+        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MintShot", "updates");
+        Directory.CreateDirectory(folder);
+        var temporary = Path.Combine(folder, Guid.NewGuid().ToString("N") + ".download");
+        try
+        {
+            using (var response = Open(new Uri(asset.browser_download_url), true))
+            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+            {
+                Transfer(response, file, asset.size);
+                if (file.Length != asset.size) throw new InvalidDataException("Установщик скачан не полностью.");
+                file.Position = 0;
+                using (var sha = SHA256.Create())
+                {
+                    string digest = BitConverter.ToString(sha.ComputeHash(file)).Replace("-", "");
+                    if (!String.Equals(asset.digest.Substring(7), digest, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException("Контрольная сумма установщика не совпадает.");
+                }
+            }
+            var installer = Path.Combine(folder, asset.name);
+            File.Delete(installer);
+            File.Move(temporary, installer);
+            return installer;
+        }
+        finally { File.Delete(temporary); }
+    }
+
+    public static void LaunchPending()
+    {
+        if (pendingInstaller == null) return;
+        try
+        {
+            var path = Path.GetDirectoryName(Application.ExecutablePath);
+            const string uninstall = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\MintShot_is1";
+            var info = new ProcessStartInfo(pendingInstaller) { UseShellExecute = true };
+            foreach (var root in new[] { Registry.CurrentUser, Registry.LocalMachine })
+            {
+                using (var key = root.OpenSubKey(uninstall))
+                {
+                    string installed = key == null ? null : key.GetValue("InstallLocation") as string;
+                    if (!String.Equals(path, (installed ?? "").TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) continue;
+                    info.Arguments = (root == Registry.LocalMachine ? "/ALLUSERS" : "/CURRENTUSER") + " /DIR=\"" + path + "\"";
+                    break;
+                }
+            }
+            Process.Start(info);
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(error.Message + "\nУстановщик: " + pendingInstaller, "Не удалось запустить обновление");
+        }
+    }
+}

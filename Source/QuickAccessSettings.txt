@@ -1,0 +1,290 @@
+using System;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Windows.Forms;
+using System.Xml.Serialization;
+
+public sealed class QuickAccessSettings
+{
+    public bool Circle;
+    public bool SimplifiedPanel;
+    public bool Light;
+    public int PanelPosition;
+    public int Tools = 255;
+    public bool Blur = true;
+    public bool Marker = true;
+    public bool PenSmoothing = true;
+    public int PenSmoothingStrength = 50;
+    public string Folder = "";
+    static readonly string FileName = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "MintShot", "quick-access.xml");
+    public static QuickAccessSettings Current = Load();
+    public static readonly string[] ToolNames = {
+        "Перемещение", "Перо", "Линия", "Стрелка", "Рамка", "Текст", "Цвет", "Отменить"
+    };
+
+    static QuickAccessSettings Load()
+    {
+        try
+        {
+            using (var stream = File.OpenRead(FileName))
+                return (QuickAccessSettings)new XmlSerializer(typeof(QuickAccessSettings)).Deserialize(stream);
+        }
+        catch (IOException) { return new QuickAccessSettings(); }
+        catch (UnauthorizedAccessException) { return new QuickAccessSettings(); }
+        catch (InvalidOperationException) { return new QuickAccessSettings(); }
+    }
+
+    public static void Install(Form form)
+    {
+        var tabs = form.Controls[0] as TabControl;
+        if (tabs == null) return;
+        var page = new TabPage("Редактор") { AutoScroll = true, Padding = new Padding(12) };
+        var layout = new TableLayoutPanel {
+            Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 130));
+        page.Controls.Add(layout);
+        tabs.TabPages.Add(page);
+        var style = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        style.Items.AddRange(new object[] { "Панель", "Кольцо", "Упрощённая" });
+        style.SelectedIndex = Current.Circle ? 1 : Current.SimplifiedPanel ? 2 : 0;
+        form.Disposed += delegate { style.Dispose(); };
+        var theme = Choice("Тёмная", "Светлая", Current.Light);
+        var menuLabel = Caption("Стиль меню");
+        Emphasize(menuLabel);
+        layout.Controls.Add(menuLabel, 0, 0);
+        layout.SetColumnSpan(menuLabel, 2);
+        var styles = new TableLayoutPanel {
+            Dock = DockStyle.Fill, ColumnCount = style.Items.Count, RowCount = 1, Margin = new Padding(0)
+        };
+        styles.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.Controls.Add(styles, 0, 1);
+        layout.SetColumnSpan(styles, 2);
+        for (int i = 0; i < style.Items.Count; i++)
+        {
+            int index = i;
+            var card = new MintMenuStyleCard(style.Items[i].ToString(), i == 1, simplified: i == 2) {
+                Dock = DockStyle.Fill, Selected = style.SelectedIndex == i
+            };
+            card.Click += delegate { style.SelectedIndex = index; };
+            style.SelectedIndexChanged += delegate { card.Selected = style.SelectedIndex == index; card.Invalidate(); };
+            styles.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / style.Items.Count));
+            styles.Controls.Add(card, i, 0);
+        }
+        var position = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+        position.Items.AddRange(new object[] { "Снизу", "Сверху", "Слева", "Справа" });
+        position.SelectedIndex = Math.Max(0, Math.Min(3, Current.PanelPosition));
+        form.Disposed += delegate { position.Dispose(); };
+        const int positionOptionsHeight = 136;
+        var positions = new TableLayoutPanel {
+            Dock = DockStyle.Top, Height = positionOptionsHeight, ColumnCount = 4, RowCount = 2,
+            Margin = new Padding(0)
+        };
+        var positionLabel = Caption("Расположение панели");
+        Emphasize(positionLabel);
+        positions.Controls.Add(positionLabel, 0, 0);
+        positions.SetColumnSpan(positionLabel, 4);
+        positions.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        positions.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        for (int i = 0; i < 4; i++)
+        {
+            int index = i;
+            positions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
+            var card = new MintMenuStyleCard(position.Items[i].ToString(), false, i) {
+                Dock = DockStyle.Fill, Selected = position.SelectedIndex == i
+            };
+            card.Click += delegate { position.SelectedIndex = index; };
+            position.SelectedIndexChanged += delegate { card.Selected = position.SelectedIndex == index; card.Invalidate(); };
+            positions.Controls.Add(card, i, 1);
+        }
+        layout.Controls.Add(positions, 0, 2);
+        layout.SetColumnSpan(positions, 2);
+        var toolOptions = new TableLayoutPanel {
+            Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2,
+            Margin = new Padding(0)
+        };
+        toolOptions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        toolOptions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        layout.Controls.Add(toolOptions, 0, 3);
+        layout.SetColumnSpan(toolOptions, 2);
+        var tools = Caption("Инструменты");
+        Emphasize(tools);
+        toolOptions.Controls.Add(tools, 0, 0);
+        toolOptions.SetColumnSpan(tools, 2);
+        var checks = new CheckBox[ToolNames.Length];
+        for (int i = 0; i < checks.Length; i++)
+        {
+            checks[i] = new CheckBox {
+                Text = ToolNames[i], AutoSize = true, Checked = (Current.Tools & (1 << i)) != 0
+            };
+            toolOptions.Controls.Add(checks[i], i % 2, 1 + i / 2);
+        }
+        var blur = new CheckBox { Text = CaptureBlur.ToolName, AutoSize = true, Checked = Current.Blur };
+        var marker = new CheckBox { Text = CaptureMarker.ToolName, AutoSize = true, Checked = Current.Marker };
+        toolOptions.Controls.Add(blur, 0, 5);
+        toolOptions.Controls.Add(marker, 1, 5);
+        Action updateStyle = delegate {
+            bool panel = style.SelectedIndex != 1;
+            positions.Visible = panel;
+            positions.Height = panel ? positionOptionsHeight : 0;
+            toolOptions.Visible = style.SelectedIndex != 2;
+            layout.PerformLayout();
+        };
+        style.SelectedIndexChanged += delegate { updateStyle(); };
+        updateStyle();
+        var smoothingLabel = Caption("Сглаживание пера");
+        Emphasize(smoothingLabel);
+        layout.Controls.Add(smoothingLabel, 0, 4);
+        layout.SetColumnSpan(smoothingLabel, 2);
+        var smoothing = new CheckBox { Text = "Стабилизация", AutoSize = true, Checked = Current.PenSmoothing };
+        var smoothingStrength = new TrackBar {
+            Minimum = 0, Maximum = 100, Value = Math.Max(0, Math.Min(100, Current.PenSmoothingStrength)),
+            Dock = DockStyle.Fill, Enabled = Current.PenSmoothing
+        };
+        smoothing.CheckedChanged += delegate { smoothingStrength.Enabled = smoothing.Checked; };
+        layout.Controls.Add(smoothing, 0, 5);
+        layout.Controls.Add(Caption("Сила, %"), 0, 6);
+        layout.Controls.Add(smoothingStrength, 1, 6);
+        layout.Controls.Add(Caption("Тема"), 0, 7);
+        layout.Controls.Add(theme, 1, 7);
+        var storage = new Panel { Dock = DockStyle.Bottom, Height = 74, Padding = new Padding(4, 0, 4, 0) };
+        var folderLabel = Caption("Папка сохранения");
+        folderLabel.Dock = DockStyle.Top;
+        folderLabel.Height = 22;
+        var folderRow = new MintFolderField { Dock = DockStyle.Top, Height = 33, Margin = new Padding(3, 1, 3, 3) };
+        var folder = folderRow.Editor;
+        folder.Text = Current.Folder;
+        folderRow.Browse.Click += delegate {
+            using (var dialog = new FolderBrowserDialog { SelectedPath = folder.Text })
+                if (dialog.ShowDialog(form) == DialogResult.OK) folder.Text = dialog.SelectedPath;
+        };
+        storage.Controls.Add(folderRow);
+        storage.Controls.Add(folderLabel);
+        tabs.TabPages[2].Controls.Add(storage);
+        var apply = form.GetType().GetField("Apply");
+        var wrap = typeof(QuickAccessSettings).GetMethod("Wrap").MakeGenericMethod(apply.FieldType.GetGenericArguments()[0]);
+        apply.SetValue(form, wrap.Invoke(null, new object[] {
+            apply.GetValue(form), form, style, theme, checks, blur, marker, folder, position, smoothing, smoothingStrength }));
+        var presentation = new MintSettingsLayout(form, tabs);
+        theme.SelectedIndexChanged += delegate { presentation.Apply(theme.SelectedIndex == 1); };
+    }
+
+    static ComboBox Choice(string first, string second, bool alternate)
+    {
+        var box = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Top };
+        box.Items.AddRange(new object[] { first, second });
+        box.SelectedIndex = alternate ? 1 : 0;
+        return box;
+    }
+
+    static Label Caption(string text)
+    {
+        return new Label { Text = text, AutoSize = true, Margin = new Padding(3, 9, 3, 3) };
+    }
+
+    public static void SavePenSmoothing()
+    {
+        string temporary = FileName + ".smoothing.tmp";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FileName));
+            using (var stream = File.Create(temporary))
+                new XmlSerializer(typeof(QuickAccessSettings)).Serialize(stream, Current);
+            if (File.Exists(FileName)) File.Replace(temporary, FileName, null);
+            else File.Move(temporary, FileName);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+    }
+
+    static void Emphasize(Label label)
+    {
+        var font = new Font(label.Font, FontStyle.Bold);
+        label.Font = font;
+        label.Disposed += delegate { font.Dispose(); };
+    }
+
+    public static void PaintTheme(Control control, bool light)
+    {
+        var theme = new MintTheme(light);
+        control.BackColor = theme.Surface;
+        control.ForeColor = theme.Text;
+        var combo = control as ComboBox;
+        if (combo != null)
+        {
+            combo.FlatStyle = FlatStyle.Flat;
+            combo.BackColor = theme.Card;
+        }
+        if (control is TextBoxBase) control.BackColor = theme.Card;
+        var check = control as CheckBox;
+        if (check != null)
+        {
+            check.FlatStyle = FlatStyle.Flat;
+            check.FlatAppearance.BorderColor = theme.Border;
+        }
+        var button = control as Button;
+        if (button != null)
+        {
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderColor = theme.Border;
+            button.FlatAppearance.MouseOverBackColor = theme.Hover;
+        }
+        foreach (Control child in control.Controls) PaintTheme(child, light);
+    }
+
+    public static Func<T, bool> Wrap<T>(Func<T, bool> original, Form form, ComboBox style,
+        ComboBox theme, CheckBox[] checks, CheckBox blur, CheckBox marker, TextBox folder, ComboBox position,
+        CheckBox smoothing, TrackBar smoothingStrength)
+    {
+        return delegate(T draft) {
+            string temporary = FileName + ".tmp";
+            try
+            {
+                var next = new QuickAccessSettings {
+                    Circle = style.SelectedIndex == 1, Light = theme.SelectedIndex == 1,
+                    SimplifiedPanel = style.SelectedIndex == 2,
+                    PanelPosition = position.SelectedIndex,
+                    Blur = blur.Checked,
+                    Marker = marker.Checked,
+                    PenSmoothing = smoothing.Checked,
+                    PenSmoothingStrength = smoothingStrength.Value,
+                    Folder = folder.Text.Trim(), Tools = 0
+                };
+                if (next.Folder.Length > 0)
+                {
+                    if (!Path.IsPathRooted(next.Folder) || !Directory.Exists(next.Folder))
+                        throw new IOException("Выберите существующую папку.");
+                    next.Folder = Path.GetFullPath(next.Folder);
+                }
+                for (int i = 0; i < checks.Length; i++)
+                    if (checks[i].Checked) next.Tools |= 1 << i;
+                Directory.CreateDirectory(Path.GetDirectoryName(FileName));
+                using (var stream = File.Create(temporary))
+                    new XmlSerializer(typeof(QuickAccessSettings)).Serialize(stream, next);
+                if (original != null && !original(draft)) return false;
+                if (File.Exists(FileName)) File.Replace(temporary, FileName, null);
+                else File.Move(temporary, FileName);
+                Current = next;
+                return true;
+            }
+            catch (Exception error)
+            {
+                MessageBox.Show(form, error.Message, "Не удалось сохранить настройки");
+                return false;
+            }
+            finally
+            {
+                try { File.Delete(temporary); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            }
+        };
+    }
+}

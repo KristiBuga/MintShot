@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
+using System.Reflection;
+using System.Windows.Media;
+using System.Xml;
+using GraphicsPath = System.Drawing.Drawing2D.GraphicsPath;
+
+static class GeometricIcons
+{
+    public static void DrawSimplifiedTool(Graphics graphics, Rectangle bounds, string name, System.Drawing.Color color)
+    {
+        switch (name)
+        {
+            case "pen":
+            case "arrow":
+            case "box":
+            case "copy":
+            case "save":
+                QuickAccessOverlay.DrawIcon(graphics, bounds, name, color);
+                break;
+            default:
+                Draw(graphics, bounds, name, color);
+                break;
+        }
+    }
+
+    static readonly Dictionary<string, GraphicsPath> Paths = new Dictionary<string, GraphicsPath>();
+
+    public static void Draw(Graphics graphics, Rectangle bounds, string name, System.Drawing.Color color)
+    {
+        var state = graphics.Save();
+        try
+        {
+            float size = Math.Min(bounds.Width, bounds.Height) * .56f;
+            graphics.TranslateTransform(bounds.X + (bounds.Width - size) / 2, bounds.Y + (bounds.Height - size) / 2);
+            graphics.ScaleTransform(size / 24, size / 24);
+            if (name == "text")
+            {
+                using (var font = new Font("Segoe UI", 17, FontStyle.Bold, GraphicsUnit.Pixel))
+                using (var brush = new SolidBrush(color))
+                using (var format = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                    graphics.DrawString("Aa", font, brush, new RectangleF(-2, 0, 28, 24), format);
+                return;
+            }
+            GraphicsPath path;
+            if (!Paths.TryGetValue(name, out path))
+            {
+                path = Load(name);
+                Paths.Add(name, path);
+            }
+            using (var pen = new System.Drawing.Pen(color, 2.5f) {
+                StartCap = LineCap.Square, EndCap = LineCap.Square, LineJoin = LineJoin.Round
+            })
+                graphics.DrawPath(pen, path);
+        }
+        finally { graphics.Restore(state); }
+    }
+
+    static GraphicsPath Load(string name)
+    {
+        var result = new GraphicsPath();
+        if (name == "blur")
+        {
+            result.AddBezier(12, 2, 9, 7, 5, 10, 5, 15);
+            result.AddBezier(5, 15, 5, 24, 19, 24, 19, 15);
+            result.AddBezier(19, 15, 19, 10, 15, 7, 12, 2);
+            result.CloseFigure();
+            return result;
+        }
+        if (name == "marker")
+        {
+            result.AddPolygon(new[] { new Point(8, 14), new Point(18, 4), new Point(22, 8),
+                new Point(12, 18) });
+            result.AddLines(new[] { new Point(8, 14), new Point(5, 17), new Point(5, 20),
+                new Point(8, 20), new Point(12, 18) });
+            result.StartFigure();
+            result.AddLine(2, 22, 9, 22);
+            return result;
+        }
+        using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MintShot.Geometry." + name))
+        using (var reader = XmlReader.Create(stream))
+        {
+            while (reader.Read())
+            {
+                if (reader.NodeType != XmlNodeType.Element) continue;
+                if (reader.LocalName == "path")
+                {
+                    var flat = Geometry.Parse(reader.GetAttribute("d")).GetFlattenedPathGeometry(.025, ToleranceType.Absolute);
+                    foreach (var figure in flat.Figures)
+                    {
+                        result.StartFigure();
+                        var points = new List<PointF> { new PointF((float)figure.StartPoint.X, (float)figure.StartPoint.Y) };
+                        foreach (var segment in figure.Segments)
+                        {
+                            var line = segment as LineSegment;
+                            if (line != null) points.Add(new PointF((float)line.Point.X, (float)line.Point.Y));
+                            var polyline = segment as PolyLineSegment;
+                            if (polyline != null)
+                                foreach (var point in polyline.Points) points.Add(new PointF((float)point.X, (float)point.Y));
+                        }
+                        if (points.Count > 1) result.AddLines(points.ToArray());
+                        if (figure.IsClosed) result.CloseFigure();
+                    }
+                }
+                else if (reader.LocalName == "circle")
+                {
+                    int x = Int32.Parse(reader.GetAttribute("cx")), y = Int32.Parse(reader.GetAttribute("cy"));
+                    int r = Int32.Parse(reader.GetAttribute("r"));
+                    result.StartFigure();
+                    result.AddEllipse(x - r, y - r, r * 2, r * 2);
+                }
+                else if (reader.LocalName == "rect")
+                {
+                    int x = Int32.Parse(reader.GetAttribute("x")), y = Int32.Parse(reader.GetAttribute("y"));
+                    int width = Int32.Parse(reader.GetAttribute("width")), height = Int32.Parse(reader.GetAttribute("height"));
+                    int radius = Int32.Parse(reader.GetAttribute("rx"));
+                    result.StartFigure();
+                    QuickAccessOverlay.AddRounded(result, new Rectangle(x, y, width, height), radius * 2);
+                }
+            }
+        }
+        return result;
+    }
+}

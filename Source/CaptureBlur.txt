@@ -1,0 +1,84 @@
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+static class CaptureBlur
+{
+    public const string ToolName = "Размытие";
+    public const int DefaultStrength = 7;
+
+    public static void Draw(Graphics target, Rectangle area, Bitmap source, int strength)
+    {
+        int scale = strength <= 3 ? 2 : 4;
+        int radius = (4 * strength - 2 + scale / 2) / scale;
+        int width = (area.Width + scale - 1) / scale;
+        int height = (area.Height + scale - 1) / scale;
+        using (var samples = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+        using (var edges = new ImageAttributes())
+        {
+            edges.SetWrapMode(WrapMode.TileFlipXY);
+            using (var graphics = Graphics.FromImage(samples))
+            {
+                graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                graphics.DrawImage(source, new Rectangle(0, 0, width, height),
+                    0, 0, source.Width, source.Height, GraphicsUnit.Pixel, edges);
+            }
+            Smooth(samples, radius);
+
+            var state = target.Save();
+            try
+            {
+                target.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                target.DrawImage(samples, area, 0, 0, width, height, GraphicsUnit.Pixel, edges);
+            }
+            finally { target.Restore(state); }
+        }
+    }
+
+    static void Smooth(Bitmap samples, int radius)
+    {
+        int width = samples.Width, height = samples.Height;
+        var pixels = new int[width * height];
+        var horizontal = new int[pixels.Length];
+        var data = samples.LockBits(new Rectangle(0, 0, width, height),
+            ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        try
+        {
+            for (int y = 0; y < height; y++)
+                Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), pixels, y * width, width);
+            for (int pass = 0; pass < 3; pass++)
+            {
+                for (int y = 0; y < height; y++) BlurLine(pixels, horizontal, y * width, 1, width, radius);
+                for (int x = 0; x < width; x++) BlurLine(horizontal, pixels, x, width, height, radius);
+            }
+            for (int y = 0; y < height; y++)
+                Marshal.Copy(pixels, y * width, IntPtr.Add(data.Scan0, y * data.Stride), width);
+        }
+        finally { samples.UnlockBits(data); }
+    }
+
+    static void BlurLine(int[] input, int[] output, int offset, int step, int length, int radius)
+    {
+        int count = 2 * radius + 1;
+        int red = 0, green = 0, blue = 0;
+        for (int sample = -radius; sample <= radius; sample++)
+        {
+            int pixel = input[offset + Math.Min(length - 1, Math.Max(0, sample)) * step];
+            red += (pixel >> 16) & 255;
+            green += (pixel >> 8) & 255;
+            blue += pixel & 255;
+        }
+        for (int i = 0; i < length; i++)
+        {
+            output[offset + i * step] = unchecked((int)0xff000000) |
+                ((red / count) << 16) | ((green / count) << 8) | (blue / count);
+            int leaving = input[offset + Math.Max(0, i - radius) * step];
+            int entering = input[offset + Math.Min(length - 1, i + radius + 1) * step];
+            red += ((entering >> 16) & 255) - ((leaving >> 16) & 255);
+            green += ((entering >> 8) & 255) - ((leaving >> 8) & 255);
+            blue += (entering & 255) - (leaving & 255);
+        }
+    }
+}

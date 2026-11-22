@@ -1,0 +1,28 @@
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+class RoundedTextBox:TextBox {
+ [DllImport("user32.dll")]static extern IntPtr SendMessage(IntPtr h,int message,IntPtr w,IntPtr l);
+ public RoundedTextBox(){BorderStyle=BorderStyle.None;}
+ protected override void OnHandleCreated(EventArgs e){base.OnHandleCreated(e);SendMessage(Handle,0xD3,new IntPtr(3),IntPtr.Zero);}
+}
+class TextEditorFrame:Panel {
+ [StructLayout(LayoutKind.Sequential)]struct Damage {public int Left,Top,Right,Bottom;}
+ [DllImport("user32.dll")]static extern bool SetWindowPos(IntPtr h,IntPtr order,int x,int y,int width,int height,uint flags);
+ [DllImport("user32.dll")]static extern bool RedrawWindow(IntPtr h,ref Damage rectangle,IntPtr region,uint flags);
+ public void MoveWithoutCopy(Point point){if(Location==point)return;if(IsHandleCreated)SetWindowPos(Handle,IntPtr.Zero,point.X,point.Y,0,0,0x011D);else Location=point;}
+ public void RefreshMovedArea(Rectangle previous){if(Parent==null||!Parent.IsHandleCreated)return;var area=Rectangle.Union(previous,Bounds);area.Inflate(3,3);area.Intersect(Parent.ClientRectangle);if(area.IsEmpty)return;var damage=new Damage{Left=area.Left,Top=area.Top,Right=area.Right,Bottom=area.Bottom};RedrawWindow(Parent.Handle,ref damage,IntPtr.Zero,0x0185);}
+
+ bool dragging;Point anchorScreen,anchorLocation;public event Action<Point> MoveRequested;public event Action DragFinished;
+ public Color BorderColor=Color.FromArgb(105,237,187);
+ public TextEditorFrame(){Cursor=Cursors.SizeAll;Padding=new Padding(4);BackColor=Color.FromArgb(30,36,45);SetStyle(ControlStyles.UserPaint|ControlStyles.AllPaintingInWmPaint|ControlStyles.OptimizedDoubleBuffer,true);}
+ GraphicsPath Shape(float inset){float w=Math.Max(1,ClientSize.Width-inset*2),h=Math.Max(1,ClientSize.Height-inset*2),d=Math.Min(16,Math.Min(w,h));var p=new GraphicsPath();p.AddArc(inset,inset,d,d,180,90);p.AddArc(inset+w-d,inset,d,d,270,90);p.AddArc(inset+w-d,inset+h-d,d,d,0,90);p.AddArc(inset,inset+h-d,d,d,90,90);p.CloseFigure();return p;}
+ protected override void OnMouseDown(MouseEventArgs e){base.OnMouseDown(e);if(e.Button!=MouseButtons.Left)return;anchorScreen=PointToScreen(e.Location);anchorLocation=Location;dragging=true;Capture=true;}
+ protected override void OnMouseMove(MouseEventArgs e){base.OnMouseMove(e);if(!dragging)return;var screen=PointToScreen(e.Location);if(MoveRequested!=null)MoveRequested(new Point(anchorLocation.X+screen.X-anchorScreen.X,anchorLocation.Y+screen.Y-anchorScreen.Y));}
+ protected override void OnMouseUp(MouseEventArgs e){base.OnMouseUp(e);if(e.Button!=MouseButtons.Left||!dragging)return;dragging=false;Capture=false;if(DragFinished!=null)DragFinished();}
+ protected override void OnMouseCaptureChanged(EventArgs e){base.OnMouseCaptureChanged(e);if(!Capture)dragging=false;}
+ protected override void OnSizeChanged(EventArgs e){base.OnSizeChanged(e);if(ClientSize.Width>1&&ClientSize.Height>1)using(var shape=Shape(0)){var old=Region;Region=new Region(shape);if(old!=null)old.Dispose();}Invalidate();}
+ protected override void OnPaint(PaintEventArgs e){base.OnPaint(e);e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;using(var shape=Shape(0.75f))using(var pen=new Pen(Color.FromArgb(210,BorderColor),1.25f))e.Graphics.DrawPath(pen,shape);}
+}

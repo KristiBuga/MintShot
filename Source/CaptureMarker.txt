@@ -1,0 +1,35 @@
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+
+static class CaptureMarker
+{
+    public const string ToolName = "Маркер";
+
+    static readonly Color Yellow = Color.FromArgb(92, 255, 207, 36);
+
+    public static void Draw(Graphics graphics, Point start, List<Point> points, int thickness)
+    {
+        float width = 10 + thickness * 2;
+        var state = graphics.Save();
+        try
+        {
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            if (points.Count == 0 || points.TrueForAll(point => point == start))
+            {
+                using (var brush = new SolidBrush(Yellow))
+                    graphics.FillEllipse(brush, start.X - width / 2, start.Y - width / 2, width, width);
+                return;
+            }
+
+            var stroke = new Point[points.Count + 1];
+            stroke[0] = start;
+            points.CopyTo(stroke, 1);
+            using (var pen = new Pen(Yellow, width) {
+                StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round
+            })
+                graphics.DrawLines(pen, stroke);
+        }
+        finally { graphics.Restore(state); }
+    }
+}

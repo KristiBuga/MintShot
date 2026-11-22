@@ -1,0 +1,74 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+
+sealed class PenStabilizer
+{
+    readonly Form form;
+    readonly FieldInfo active, tool, points, end;
+    object mark;
+    double x, y;
+    int strength;
+
+    public PenStabilizer(Form form)
+    {
+        this.form = form;
+        const BindingFlags fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        active = form.GetType().GetField("active", fields);
+        var markType = active.FieldType;
+        tool = markType.GetField("Tool", fields);
+        points = markType.GetField("Points", fields);
+        end = markType.GetField("B", fields);
+    }
+
+    public void Begin(Point origin)
+    {
+        mark = null;
+        var candidate = active.GetValue(form);
+        var settings = QuickAccessSettings.Current;
+        if (candidate == null || (string)tool.GetValue(candidate) != "Перо" ||
+            !settings.PenSmoothing || settings.PenSmoothingStrength <= 0) return;
+        mark = candidate;
+        strength = Math.Min(100, settings.PenSmoothingStrength);
+        x = origin.X;
+        y = origin.Y;
+    }
+
+    public void Move(Point cursor)
+    {
+        if (mark == null || !ReferenceEquals(active.GetValue(form), mark)) return;
+        var path = (List<Point>)points.GetValue(mark);
+        if (path == null || path.Count == 0) return;
+        double dx = cursor.X - x, dy = cursor.Y - y;
+        double distance = Math.Sqrt(dx * dx + dy * dy);
+        double response = Math.Min(1, Math.Max(.06, distance / (3 + strength * .35)));
+        x += dx * response;
+        y += dy * response;
+        var filtered = new Point((int)Math.Round(x), (int)Math.Round(y));
+        path[path.Count - 1] = filtered;
+        end.SetValue(mark, filtered);
+    }
+
+    public void Finish(Point cursor)
+    {
+        if (mark == null) return;
+        var path = (List<Point>)points.GetValue(mark);
+        if (path != null)
+        {
+            var start = new PointF((float)x, (float)y);
+            for (int step = 1; step <= 5; step++)
+            {
+                double amount = step / 5.0;
+                var point = new Point((int)Math.Round(start.X + (cursor.X - start.X) * amount),
+                    (int)Math.Round(start.Y + (cursor.Y - start.Y) * amount));
+                if (path.Count == 0 || path[path.Count - 1] != point) path.Add(point);
+            }
+        }
+        end.SetValue(mark, cursor);
+        mark = null;
+    }
+
+    public void Cancel() { mark = null; }
+}

@@ -1,0 +1,16 @@
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+class FrameClock:IDisposable {
+ public const int Message=0x805A;
+ [DllImport("user32.dll")]static extern bool PostMessage(IntPtr h,int message,IntPtr w,IntPtr l);
+ [DllImport("winmm.dll")]static extern uint timeBeginPeriod(uint period);
+ [DllImport("winmm.dll")]static extern uint timeEndPeriod(uint period);
+ readonly IntPtr window;readonly Thread thread;volatile bool running=true;int dirty=1,queued;
+ public FrameClock(IntPtr handle){window=handle;thread=new Thread(Loop){IsBackground=true,Name="MintShot 120 Hz",Priority=ThreadPriority.AboveNormal};thread.Start();}
+ public void Request(){Interlocked.Exchange(ref dirty,1);}
+ public bool Consume(){Interlocked.Exchange(ref queued,0);return Interlocked.Exchange(ref dirty,0)!=0;}
+ void Loop(){timeBeginPeriod(1);try{var watch=Stopwatch.StartNew();double interval=Stopwatch.Frequency/120.0,next=watch.ElapsedTicks;while(running){next+=interval;while(running){double left=next-watch.ElapsedTicks;if(left<=0)break;if(left>Stopwatch.Frequency*0.0015)Thread.Sleep(1);else Thread.SpinWait(80);}if(!running)break;if(Interlocked.CompareExchange(ref dirty,0,0)!=0&&Interlocked.CompareExchange(ref queued,1,0)==0){if(!PostMessage(window,Message,IntPtr.Zero,IntPtr.Zero))Interlocked.Exchange(ref queued,0);}if(watch.ElapsedTicks-next>interval*2)next=watch.ElapsedTicks;}}finally{timeEndPeriod(1);}}
+ public void Dispose(){running=false;thread.Join(100);}
+}

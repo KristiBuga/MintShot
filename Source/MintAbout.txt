@@ -1,0 +1,45 @@
+using System;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+
+static class MintAbout
+{
+    public static void Style(Form form)
+    {
+        form.SuspendLayout();
+        while (form.Controls.Count > 0)
+        {
+            var control = form.Controls[0];
+            form.Controls.RemoveAt(0);
+            control.Dispose();
+        }
+        var theme = new MintTheme(QuickAccessSettings.Current.Light);
+        form.Text = "О программе";
+        form.ClientSize = new Size(390, 235);
+        form.BackColor = theme.Card;
+        form.ForeColor = theme.Text;
+        var titleFont = new Font("Segoe UI", 20);
+        form.Disposed += delegate { titleFont.Dispose(); };
+        var header = new Panel { Dock = DockStyle.Top, Height = 151, BackColor = theme.Surface };
+        header.Controls.Add(new Label { Text = "MintShot", Font = titleFont, AutoSize = true, Location = new Point(22, 30) });
+        var version = Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
+        header.Controls.Add(new Label { Text = "Версия " + version, ForeColor = theme.Muted, AutoSize = true, Location = new Point(25, 77) });
+        header.Controls.Add(new PictureBox { Image = AppBrand.Logo, SizeMode = PictureBoxSizeMode.Zoom,
+            Bounds = new Rectangle(240, 16, 125, 120) });
+        var detail = new Label { Text = "Скриншоты и разметка для Windows", ForeColor = theme.Muted,
+            AutoSize = true, Location = new Point(24, 171) };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat,
+            Bounds = new Rectangle(284, 189, 84, 30), BackColor = theme.Hover, ForeColor = theme.Text };
+        ok.FlatAppearance.BorderColor = theme.Border;
+        var project = new LinkLabel { Text = "MintShot на GitHub", LinkColor = theme.Accent,
+            ActiveLinkColor = theme.Text, VisitedLinkColor = theme.Accent, AutoSize = true, Location = new Point(24, 195) };
+        project.LinkClicked += delegate {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/KristiBuga/MintShot") { UseShellExecute = true });
+        };
+        form.Controls.AddRange(new Control[] { header, detail, project, ok });
+        form.AcceptButton = ok;
+        form.CancelButton = ok;
+        form.ResumeLayout(true);
+    }
+}

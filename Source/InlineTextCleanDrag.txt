@@ -1,0 +1,34 @@
+using System;
+using System.Collections;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+
+class InlineText:IDisposable {
+ readonly Form form;readonly FieldInfo selection,selected,tool,color,stroke;readonly IList marks;readonly Type markType;readonly FieldInfo markText,markTool,markPoint,markEnd,markColor,markWidth;Point originalPoint,originalEnd;TextBox editor;TextEditorFrame editFrame;object editing;bool fresh,finishing,previewBefore;string original;
+ const BindingFlags Fields=BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic;
+ readonly Action save, committed;
+ public InlineText(Form overlay, Action save, Action committed){this.save=save;this.committed=committed;form=overlay;var t=form.GetType();selection=t.GetField("selection",Fields);selected=t.GetField("selected",Fields);tool=t.GetField("tool",Fields);color=t.GetField("color",Fields);stroke=t.GetField("stroke",Fields);marks=(IList)t.GetField("marks",Fields).GetValue(form);markType=t.Assembly.GetType("MintShot.Mark");markText=markType.GetField("Text",Fields);markTool=markType.GetField("Tool",Fields);markPoint=markType.GetField("A",Fields);markEnd=markType.GetField("B",Fields);markColor=markType.GetField("Color",Fields);markWidth=markType.GetField("Width",Fields);
+  foreach(Control panel in form.Controls)if(panel is FlowLayoutPanel)foreach(Control button in panel.Controls)button.MouseDown+=delegate{Finish(false);};form.FormClosing+=delegate{Finish(false);};
+ }
+ public bool MouseDown(Point point){
+  if(editor!=null)Finish(false);
+  if(!(bool)selected.GetValue(form))return false;var area=(Rectangle)selection.GetValue(form);if(!area.Contains(point))return false;
+  // Keep the eight resize handles available, including with the Text tool active.
+  int cx=area.Left+area.Width/2,cy=area.Top+area.Height/2;foreach(var h in new[]{new Point(area.Left,area.Top),new Point(cx,area.Top),new Point(area.Right,area.Top),new Point(area.Right,cy),new Point(area.Right,area.Bottom),new Point(cx,area.Bottom),new Point(area.Left,area.Bottom),new Point(area.Left,cy)})if(new Rectangle(h.X-7,h.Y-7,14,14).Contains(point))return false;
+  string activeTool=(string)tool.GetValue(form);if(activeTool!="Текст"&&activeTool!=""&&activeTool!="Область")return false;
+  object hit=HitTest(point);if(hit!=null){Begin(hit,false);editor.Select(editor.GetCharIndexFromPosition(editor.PointToClient(form.PointToScreen(point))),0);return true;}if(activeTool!="Текст")return false;
+  int minWidth=Math.Min(24,area.Width),minHeight=Math.Min(45,area.Height);var origin=new Point(Math.Min(point.X,area.Right-minWidth),Math.Min(point.Y,area.Bottom-minHeight));
+  var mark=Activator.CreateInstance(markType,new object[]{"Текст",(Color)color.GetValue(form),(int)stroke.GetValue(form),origin,origin});marks.Add(mark);Begin(mark,true);return true;
+ }
+ object HitTest(Point point){using(var g=form.CreateGraphics())for(int i=marks.Count-1;i>=0;i--){var mark=marks[i];if((string)markTool.GetValue(mark)!="Текст")continue;string text=(string)markText.GetValue(mark);if(String.IsNullOrEmpty(text))continue;using(var font=FontFor(mark)){var size=g.MeasureString(text,font);var p=(Point)markPoint.GetValue(mark);var rect=new RectangleF(p.X,p.Y,Math.Max(8,size.Width),Math.Max(font.Height,size.Height));rect.Inflate(4,4);if(rect.Contains(point))return mark;}}return null;}
+ Font FontFor(object mark){return new Font("Segoe UI",Math.Max(16,(int)markWidth.GetValue(mark)*6),FontStyle.Bold);}
+ void Begin(object mark,bool isNew){editing=mark;fresh=isNew;original=(string)markText.GetValue(mark);originalPoint=(Point)markPoint.GetValue(mark);originalEnd=(Point)markEnd.GetValue(mark);previewBefore=form.KeyPreview;form.KeyPreview=false;var origin=(Point)markPoint.GetValue(mark);editor=new RoundedTextBox{Multiline=true,WordWrap=false,AcceptsReturn=true,ScrollBars=ScrollBars.None,BorderStyle=BorderStyle.None,BackColor=Color.FromArgb(30,36,45),ForeColor=(Color)markColor.GetValue(mark),Font=FontFor(mark),Dock=DockStyle.Fill,Text=original,MaxLength=10000,TabStop=true,Cursor=Cursors.IBeam};editFrame=new TextEditorFrame{Location=origin,BorderColor=editor.ForeColor};editFrame.MoveRequested+=MoveEditor;editFrame.DragFinished+=delegate{if(editor!=null&&!editor.IsDisposed)editor.Focus();};editFrame.Controls.Add(editor);form.Controls.Add(editFrame);editFrame.BringToFront();
+  editor.TextChanged+=delegate{if(editor==null||finishing)return;markText.SetValue(editing,editor.Text);Fit();form.Invalidate();};editor.KeyDown+=Key;editor.LostFocus+=delegate{Finish(false);};Fit();editor.Focus();editor.Select(editor.TextLength,0);form.Invalidate();
+ }
+ void MoveEditor(Point requested){if(editor==null||editFrame==null||finishing)return;var area=(Rectangle)selection.GetValue(form);var point=new Point(Math.Max(area.Left,Math.Min(Math.Max(area.Left,area.Right-editFrame.Width),requested.X)),Math.Max(area.Top,Math.Min(Math.Max(area.Top,area.Bottom-editFrame.Height),requested.Y)));var previous=editFrame.Bounds;markPoint.SetValue(editing,point);markEnd.SetValue(editing,point);editFrame.MoveWithoutCopy(point);Fit();editFrame.RefreshMovedArea(previous);}
+ void Fit(){if(editor==null)return;var area=(Rectangle)selection.GetValue(form);int maxWidth=Math.Max(4,area.Right-editFrame.Left),maxHeight=Math.Max(4,area.Bottom-editFrame.Top);Size size;using(var g=editor.CreateGraphics())size=TextRenderer.MeasureText(g,editor.Text.Length==0?" ":editor.Text,editor.Font,new Size(Int32.MaxValue,Int32.MaxValue),TextFormatFlags.NoPadding|TextFormatFlags.NoPrefix);editFrame.Size=new Size(Math.Min(maxWidth,Math.Max(Math.Min(24,maxWidth),size.Width+10)),Math.Min(maxHeight,size.Height+10));}
+ void Key(object sender,KeyEventArgs e){if(e.KeyCode==Keys.Escape){e.SuppressKeyPress=true;Finish(true);form.Focus();}else if(e.KeyCode==Keys.Enter&&!e.Shift){e.SuppressKeyPress=true;Finish(false);form.Focus();}else if(e.Control&&e.KeyCode==Keys.S){e.SuppressKeyPress=true;Finish(false);save();}}
+ public void Finish(bool cancel){if(editor==null||finishing)return;finishing=true;var box=editor;var frame=editFrame;try{if(cancel){if(fresh)marks.Remove(editing);else{markText.SetValue(editing,original);markPoint.SetValue(editing,originalPoint);markEnd.SetValue(editing,originalEnd);}}else{markText.SetValue(editing,box.Text);if(String.IsNullOrWhiteSpace(box.Text))marks.Remove(editing);}editor=null;editFrame=null;form.Controls.Remove(frame);var font=box.Font;frame.Dispose();font.Dispose();form.KeyPreview=previewBefore;editing=null;committed();form.Invalidate();}finally{finishing=false;}}
+ public void Dispose(){Finish(false);}
+}

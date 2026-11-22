@@ -1,0 +1,95 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Security;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+[assembly: AssemblyTitle("MintShot")]
+[assembly: AssemblyProduct("MintShot")]
+[assembly: AssemblyDescription("MintShot")]
+[assembly: AssemblyVersion("1.0.40.0")]
+[assembly: AssemblyFileVersion("1.0.40.0")]
+
+static class NotificationBrand
+{
+    const string AppId = "MintShot.ScreenshotNotifications";
+    // Capture confirmations have no action to activate.
+    const string NoActivation = "{8A800453-E6D6-493E-AD9B-F460974C0A82}";
+    static object notifier;
+    static Type xmlType;
+    static Type toastType;
+    static MethodInfo showToast;
+
+    static Type WindowsType(string name)
+    {
+        return Type.GetType(name + ", Windows, ContentType=WindowsRuntime", true);
+    }
+
+    static void Register()
+    {
+        string directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MintShot");
+        Directory.CreateDirectory(directory);
+        string iconPath = Path.Combine(directory, "notification-feather.png");
+        using (var source = Assembly.GetExecutingAssembly().GetManifestResourceStream("MintShot.NotificationLogo"))
+        using (var target = File.Create(iconPath))
+            source.CopyTo(target);
+
+        using (var key = Registry.CurrentUser.CreateSubKey(@"Software\Classes\AppUserModelId\" + AppId))
+        {
+            key.SetValue("DisplayName", "MintShot");
+            key.SetValue("IconUri", iconPath);
+            key.SetValue("CustomActivator", NoActivation);
+        }
+
+        xmlType = WindowsType("Windows.Data.Xml.Dom.XmlDocument");
+        toastType = WindowsType("Windows.UI.Notifications.ToastNotification");
+        showToast = WindowsType("Windows.UI.Notifications.ToastNotifier").GetMethod("Show");
+        var manager = WindowsType("Windows.UI.Notifications.ToastNotificationManager");
+        notifier = manager.GetMethod("CreateToastNotifier", new[] { typeof(string) })
+            .Invoke(null, new object[] { AppId });
+    }
+
+    static void Show(string text)
+    {
+        if (notifier == null) Register();
+        var xml = Activator.CreateInstance(xmlType);
+        xmlType.GetMethod("LoadXml", new[] { typeof(string) }).Invoke(xml, new object[] {
+            "<toast><visual><binding template=\"ToastGeneric\"><text>" +
+            SecurityElement.Escape(text) + "</text></binding></visual></toast>"
+        });
+        var toast = Activator.CreateInstance(toastType, new[] { xml });
+        showToast.Invoke(notifier, new[] { toast });
+    }
+
+    public static void Install(Assembly core, NotifyIcon tray)
+    {
+        var preferences = core.GetType("MintShot.Preferences");
+        var currentPreference = preferences.GetField("Current");
+        var notificationsEnabled = preferences.GetField("Notifications");
+        preferences.GetField("Notify").SetValue(null, new Action<string>(delegate(string text) {
+            var current = currentPreference.GetValue(null);
+            if (!(bool)notificationsEnabled.GetValue(current) || string.IsNullOrEmpty(text)) return;
+            // Give the shell a moment to leave the fullscreen capture window.
+            var delay = new Timer { Interval = 350 };
+            delay.Tick += delegate {
+                delay.Dispose();
+                if (!(bool)notificationsEnabled.GetValue(currentPreference.GetValue(null))) return;
+                try
+                {
+                    Show(text);
+                }
+                catch (Exception error)
+                {
+                    Trace.WriteLine(error);
+                    tray.BalloonTipTitle = "MintShot";
+                    tray.BalloonTipText = text;
+                    tray.ShowBalloonTip(4200);
+                }
+            };
+            delay.Start();
+        }));
+    }
+}

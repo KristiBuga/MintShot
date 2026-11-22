@@ -1,0 +1,71 @@
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+
+static class CaptureSpecks
+{
+    public static void Remove(Bitmap bitmap)
+    {
+        var data = bitmap.LockBits(new Rectangle(Point.Empty, bitmap.Size),
+            ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+        try
+        {
+            int width = bitmap.Width, height = bitmap.Height, stride = width * 4;
+            var pixels = new byte[checked(stride * height)];
+            for (int y = 0; y < height; y++)
+                Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), pixels, y * stride, stride);
+            var seen = new bool[checked(width * height)];
+            var component = new System.Collections.Generic.List<int>();
+            for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+            {
+                int first = y * width + x;
+                if (seen[first] || !IsGray(pixels, first * 4)) continue;
+                component.Clear();
+                component.Add(first);
+                seen[first] = true;
+                bool dark = true;
+                int blue = 0, green = 0, red = 0, samples = 0;
+                for (int i = 0; i < component.Count; i++)
+                {
+                    int cx = component[i] % width, cy = component[i] / width;
+                    if (cx == 0 || cy == 0 || cx == width - 1 || cy == height - 1)
+                        dark = false;
+                    for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        if ((dx == 0 && dy == 0) || cx + dx < 0 || cx + dx >= width || cy + dy < 0 || cy + dy >= height) continue;
+                        int next = (cy + dy) * width + cx + dx, p = next * 4;
+                        if (IsGray(pixels, p))
+                        {
+                            if (!seen[next]) { seen[next] = true; component.Add(next); }
+                        }
+                        else if (dark)
+                        {
+                            if (pixels[p] > 125 || pixels[p + 1] > 125 || pixels[p + 2] > 125) dark = false;
+                            else { blue += pixels[p]; green += pixels[p + 1]; red += pixels[p + 2]; samples++; }
+                        }
+                    }
+                    if (component.Count > 24) dark = false;
+                }
+                if (!dark || samples == 0) continue;
+                foreach (int pixel in component)
+                {
+                    int p = pixel * 4;
+                    pixels[p] = (byte)((blue + samples / 2) / samples);
+                    pixels[p + 1] = (byte)((green + samples / 2) / samples);
+                    pixels[p + 2] = (byte)((red + samples / 2) / samples);
+                }
+            }
+            for (int y = 0; y < height; y++)
+                Marshal.Copy(pixels, y * stride, IntPtr.Add(data.Scan0, y * data.Stride), stride);
+        }
+        finally { bitmap.UnlockBits(data); }
+    }
+
+    static bool IsGray(byte[] pixels, int p)
+    {
+        return pixels[p] == 211 && pixels[p + 1] == 211 && pixels[p + 2] == 211;
+    }
+}

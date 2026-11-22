@@ -1,0 +1,371 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+sealed class MintTheme
+{
+    public readonly Color Surface, Card, Text, Muted, Border, Accent, Hover;
+
+    public MintTheme(bool light)
+    {
+        Surface = light ? Color.FromArgb(242, 245, 245) : Color.FromArgb(27, 29, 31);
+        Card = light ? Color.White : Color.FromArgb(36, 39, 41);
+        Text = light ? Color.FromArgb(28, 38, 35) : Color.FromArgb(240, 244, 243);
+        Muted = light ? Color.FromArgb(72, 86, 80) : Color.FromArgb(174, 186, 182);
+        Border = light ? Color.FromArgb(197, 208, 203) : Color.FromArgb(73, 80, 81);
+        Accent = light ? Color.FromArgb(0, 117, 69) : Color.FromArgb(143, 239, 180);
+        Hover = light ? Color.FromArgb(222, 244, 231) : Color.FromArgb(48, 76, 63);
+    }
+}
+
+sealed class MintTrayRenderer : ToolStripProfessionalRenderer
+{
+    const int CornerDiameter = 12;
+    readonly MintTheme theme;
+    static readonly string[] Icons = { "capture-corners", "preferences", "about-document", "help-bubble", "update-download", "exit-door" };
+
+    public MintTrayRenderer(MintTheme theme)
+    {
+        this.theme = theme;
+        RoundedEdges = false;
+    }
+
+    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e) { e.Graphics.Clear(theme.Card); }
+    protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
+    protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+    {
+        using (var path = new GraphicsPath())
+        using (var pen = new Pen(theme.Border))
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            QuickAccessOverlay.AddRounded(path,
+                new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1), CornerDiameter);
+            e.Graphics.DrawPath(pen, path);
+        }
+    }
+    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+    {
+        const int inset = 10;
+        var bounds = e.Item.Bounds;
+        int left = Math.Max(0, inset - bounds.Left);
+        int right = Math.Min(e.Item.Width - 1, e.ToolStrip.ClientSize.Width - bounds.Left - inset - 1);
+        using (var pen = new Pen(theme.Border))
+            e.Graphics.DrawLine(pen, left, e.Item.Height / 2, right, e.Item.Height / 2);
+    }
+    protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+    {
+        if (!e.Item.Selected || !e.Item.Enabled) return;
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var shape = new GraphicsPath())
+        using (var brush = new SolidBrush(theme.Hover))
+        {
+            QuickAccessOverlay.AddRounded(shape, new Rectangle(4, 1, e.Item.Width - 8, e.Item.Height - 2), 8);
+            e.Graphics.FillPath(brush, shape);
+        }
+    }
+    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+    {
+        e.TextColor = e.Item.Enabled ? theme.Text : theme.Muted;
+        var bounds = e.TextRectangle;
+        bounds.Y = 0;
+        bounds.Height = e.Item.Height;
+        var format = (e.TextFormat & ~TextFormatFlags.Bottom) | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine;
+        TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, bounds, e.TextColor, format);
+    }
+    protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
+    {
+        var icon = e.Item.Tag as string;
+        if (icon == null) return;
+        var bounds = e.ImageRectangle;
+        bounds.Y = (e.Item.Height - bounds.Height) / 2;
+        var previous = e.Graphics.SmoothingMode;
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        QuickAccessOverlay.DrawIcon(e.Graphics, bounds, icon, e.Item.Enabled ? theme.Accent : theme.Muted, .94f);
+        e.Graphics.SmoothingMode = previous;
+    }
+
+    public static void Install(ContextMenuStrip menu)
+    {
+        int index = 0;
+        foreach (ToolStripItem item in menu.Items)
+            if (item is ToolStripMenuItem && index < Icons.Length) item.Tag = Icons[index++];
+        StyleMenu(menu);
+    }
+
+    public static void StyleMenu(ContextMenuStrip menu)
+    {
+        // The transparent image reserves the same icon slot for every command.
+        int size = (menu.ImageScalingSize.Width * 22 + 8) / 16;
+        menu.ImageScalingSize = new Size(size, size);
+        var spacer = new Bitmap(size, size);
+        menu.Disposed += delegate { spacer.Dispose(); };
+        foreach (ToolStripItem item in menu.Items)
+        {
+            if (!(item is ToolStripMenuItem) || !(item.Tag is string)) continue;
+            item.Image = spacer;
+            item.Padding = new Padding(0, 4, 12, 4);
+        }
+        menu.Opening += delegate { menu.Renderer = new MintTrayRenderer(new MintTheme(QuickAccessSettings.Current.Light)); };
+        menu.SizeChanged += delegate { RoundMenu(menu); };
+        RoundMenu(menu);
+    }
+
+    static void RoundMenu(ContextMenuStrip menu)
+    {
+        if (menu.Width < 2 || menu.Height < 2) return;
+        using (var path = new GraphicsPath())
+        {
+            QuickAccessOverlay.AddRounded(path, menu.ClientRectangle, CornerDiameter);
+            var previous = menu.Region;
+            menu.Region = new Region(path);
+            if (previous != null) previous.Dispose();
+        }
+    }
+}
+
+sealed class MintSettingsLayout
+{
+    const int WindowCornerDiameter = 18;
+    static readonly Dictionary<Form, MintSettingsLayout> Active = new Dictionary<Form, MintSettingsLayout>();
+    readonly Form form;
+    readonly Panel host, navigation, header;
+    readonly Panel[] pages;
+    readonly Button[] tabs;
+    readonly Label title;
+    readonly MintCloseButton close;
+    int active;
+    MintTheme theme;
+
+    [DllImport("user32.dll")] static extern bool ReleaseCapture();
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr window, string app, string classes);
+    bool lightTheme;
+    [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+
+    public MintSettingsLayout(Form form, TabControl legacy)
+    {
+        this.form = form;
+        Active.Add(form, this);
+        var titleFont = new Font("Segoe UI", 15, FontStyle.Bold);
+        form.Disposed += delegate { Active.Remove(form); titleFont.Dispose(); };
+        form.SuspendLayout();
+        form.FormBorderStyle = FormBorderStyle.None;
+        int screenHeight = Screen.FromPoint(Cursor.Position).WorkingArea.Height - 32;
+        form.ClientSize = new Size(Math.Max(770, form.ClientSize.Width + 220),
+            Math.Min(screenHeight, Math.Max(790, form.ClientSize.Height + 445)));
+        form.Region = RoundedRegion(form.ClientRectangle, WindowCornerDiameter);
+        form.Paint += delegate(object sender, PaintEventArgs e) {
+            if (theme == null) return;
+            using (var path = new GraphicsPath())
+            using (var pen = new Pen(theme.Border))
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                QuickAccessOverlay.AddRounded(path, new Rectangle(1, 1, form.Width - 3, form.Height - 3),
+                    WindowCornerDiameter - 2);
+                e.Graphics.DrawPath(pen, path);
+                e.Graphics.DrawLine(pen, 1, 56, form.ClientSize.Width - 2, 56);
+            }
+        };
+        // Keep child-window painting inside the rounded top edge.
+        int headerInset = WindowCornerDiameter / 2;
+        header = new Panel { Bounds = new Rectangle(headerInset, 2, form.ClientSize.Width - 2 * headerInset, 54) };
+        var logo = new Panel { Bounds = new Rectangle(21 - headerInset, 13, 27, 27) };
+        logo.Paint += delegate(object sender, PaintEventArgs e) {
+            QuickAccessOverlay.DrawCorners(e.Graphics, new Rectangle(4, 4, 18, 18), theme.Accent);
+        };
+        title = new Label { Text = "Настройки MintShot", Font = titleFont, AutoSize = true,
+            Location = new Point(57 - headerInset, 13) };
+        close = new MintCloseButton { Bounds = new Rectangle(header.Width + headerInset - 48, 9, 36, 36) };
+        close.Click += delegate {
+            if (form.CancelButton != null) form.CancelButton.PerformClick();
+            else { form.DialogResult = DialogResult.Cancel; form.Close(); }
+        };
+        header.Controls.AddRange(new Control[] { logo, title, close });
+        foreach (var control in new Control[] { header, logo, title })
+            control.MouseDown += DragWindow;
+        host = new Panel { Bounds = new Rectangle(2, 57, form.ClientSize.Width - 4, form.ClientSize.Height - 116) };
+        navigation = new Panel { Bounds = new Rectangle(0, 0, 178, host.Height), Padding = new Padding(9, 12, 10, 0) };
+        navigation.Paint += delegate(object sender, PaintEventArgs e) {
+            using (var pen = new Pen(theme.Border))
+                e.Graphics.DrawLine(pen, navigation.Width - 1, 0, navigation.Width - 1, navigation.Height);
+        };
+        pages = new Panel[legacy.TabPages.Count];
+        tabs = new Button[pages.Length];
+        var menu = new TableLayoutPanel { Dock = DockStyle.Top, Height = tabs.Length * 43, ColumnCount = 1, RowCount = tabs.Length };
+        navigation.Controls.Add(menu);
+        string[] labels = { "Захват", "Горячие клавиши", "Сохранение", "Редактор" };
+        string[] icons = { "box", "keyboard", "save", "pen" };
+        int[] order = { 0, 2, 3, 1 };
+        var pageFont = new Font("Segoe UI", 17, FontStyle.Bold);
+        form.Disposed += delegate { pageFont.Dispose(); };
+        for (int i = 0; i < pages.Length; i++)
+        {
+            var original = legacy.TabPages[i];
+            var page = new Panel {
+                Bounds = new Rectangle(198, 60, host.Width - 219, host.Height - 64),
+                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right | AnchorStyles.Bottom,
+                AutoScroll = true, Visible = false
+            };
+            var controls = new Control[original.Controls.Count];
+            original.Controls.CopyTo(controls, 0);
+            page.Controls.AddRange(controls);
+            MintSettingsInputs.Install(page);
+            if (i == 1) MintSettingsInputs.StyleShortcuts(page);
+            var heading = new Label { Text = labels[i], Font = pageFont, AutoSize = true, Location = new Point(198, 15), Visible = false };
+            heading.Tag = page;
+            host.Controls.Add(heading);
+            pages[i] = page;
+            page.HandleCreated += delegate { ApplyScrollTheme(page); };
+            host.Controls.Add(page);
+            int index = i;
+            var button = new Button {
+                Text = labels[i], Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat,
+                TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(36, 0, 0, 0),
+                Margin = new Padding(0, 0, 0, 5)
+            };
+            button.Paint += delegate(object sender, PaintEventArgs e) {
+                var graphic = new Rectangle(4, (button.Height - 27) / 2, 29, 27);
+                if (icons[index] != "keyboard") GeometricIcons.Draw(e.Graphics, graphic, icons[index], button.ForeColor);
+                else using (var pen = new Pen(button.ForeColor, 1.3f))
+                {
+                    int x = graphic.X + 6, y = graphic.Y + 8;
+                    e.Graphics.DrawRectangle(pen, x, y, 18, 11);
+                    for (int key = 0; key < 4; key++) e.Graphics.DrawLine(pen, x + 3 + key * 4, y + 4, x + 4 + key * 4, y + 4);
+                    e.Graphics.DrawLine(pen, x + 5, y + 8, x + 13, y + 8);
+                }
+            };
+            button.FlatAppearance.BorderSize = 0;
+            button.SizeChanged += delegate {
+                if (button.Width < 4 || button.Height < 4) return;
+                var previous = button.Region;
+                button.Region = RoundedRegion(button.ClientRectangle, 12);
+                if (previous != null) previous.Dispose();
+            };
+            button.Click += delegate { Select(index); };
+            tabs[i] = button;
+            menu.RowStyles.Add(new RowStyle(SizeType.Absolute, 43));
+            menu.Controls.Add(button, 0, order[i]);
+        }
+        menu.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        host.Controls.Add(navigation);
+        navigation.BringToFront();
+        legacy.Hide();
+        form.Controls.Add(host);
+        form.Controls.Add(header);
+        header.BringToFront();
+        var accept = form.AcceptButton as Button;
+        var cancel = form.CancelButton as Button;
+        if (accept != null)
+        {
+            accept.Text = "Сохранить";
+            LayoutFooter(accept, form.ClientSize.Width - 130);
+        }
+        if (cancel != null)
+        {
+            LayoutFooter(cancel, form.ClientSize.Width - 244);
+        }
+        form.ResumeLayout(true);
+        Apply(QuickAccessSettings.Current.Light);
+    }
+
+    static Region RoundedRegion(Rectangle bounds, int diameter)
+    {
+        using (var path = new GraphicsPath())
+        {
+            QuickAccessOverlay.AddRounded(path, bounds, diameter);
+            return new Region(path);
+        }
+    }
+
+    void LayoutFooter(Button button, int x)
+    {
+        button.Bounds = new Rectangle(x, form.ClientSize.Height - 50, 108, 34);
+        button.Paint += PaintFooter;
+        button.BringToFront();
+    }
+
+    void PaintFooter(object sender, PaintEventArgs e)
+    {
+        var button = (Button)sender;
+        var bounds = button.ClientRectangle;
+        bool hovered = bounds.Contains(button.PointToClient(Cursor.Position));
+        bool primary = ReferenceEquals(button, form.AcceptButton);
+        var fill = primary ? (hovered ? button.FlatAppearance.MouseOverBackColor : theme.Accent)
+            : hovered ? theme.Hover : theme.Surface;
+        var outline = button.Focused ? theme.Accent : primary ? fill : theme.Border;
+        e.Graphics.Clear(theme.Surface);
+        MintSettingsInputs.DrawFrame(e.Graphics, new Rectangle(1, 1, bounds.Width - 3, bounds.Height - 3),
+            fill, outline);
+        TextRenderer.DrawText(e.Graphics, button.Text, button.Font, bounds, button.ForeColor,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+    }
+
+    void DragWindow(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        ReleaseCapture();
+        SendMessage(form.Handle, 0xA1, new IntPtr(2), IntPtr.Zero);
+    }
+
+    public static Control Page(Form form, int index)
+    {
+        MintSettingsLayout layout;
+        if (Active.TryGetValue(form, out layout)) return layout.pages[index];
+        var tabs = form.Controls[0] as TabControl;
+        return tabs == null ? null : tabs.TabPages[index];
+    }
+
+    void Select(int index)
+    {
+        active = index;
+        for (int i = 0; i < pages.Length; i++)
+        {
+            pages[i].Visible = i == index;
+            tabs[i].BackColor = i == index ? theme.Hover : theme.Surface;
+            tabs[i].ForeColor = i == index ? theme.Accent : theme.Text;
+            tabs[i].FlatAppearance.MouseOverBackColor = theme.Hover;
+        }
+        foreach (Control control in host.Controls)
+            if (control.Tag is Panel) control.Visible = ReferenceEquals(control.Tag, pages[index]);
+    }
+
+    public void Apply(bool light)
+    {
+        lightTheme = light;
+        theme = new MintTheme(light);
+        QuickAccessSettings.PaintTheme(form, light);
+        close.SetTheme(theme);
+        foreach (var page in pages)
+        {
+            PaintPage(page);
+            ApplyScrollTheme(page);
+        }
+        Select(active);
+        var accept = form.AcceptButton as Button;
+        if (accept != null)
+        {
+            accept.BackColor = theme.Accent;
+            accept.ForeColor = light ? Color.White : Color.FromArgb(13, 44, 29);
+            accept.FlatAppearance.BorderSize = 0;
+            accept.FlatAppearance.MouseOverBackColor = light ? Color.FromArgb(0, 134, 79) : Color.FromArgb(136, 244, 200);
+        }
+    }
+
+    void ApplyScrollTheme(Panel page)
+    {
+        if (!page.IsHandleCreated) return;
+        SetWindowTheme(page.Handle, lightTheme ? "Explorer" : "DarkMode_Explorer", null);
+    }
+
+    void PaintPage(Control control)
+    {
+        var input = control as IMintSettingsInput;
+        if (input != null) input.SetTheme(theme);
+        if (control is Panel || control is Label || control is CheckBox)
+            control.BackColor = theme.Card;
+        foreach (Control child in control.Controls) PaintPage(child);
+    }
+}

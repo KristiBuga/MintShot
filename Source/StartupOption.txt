@@ -1,0 +1,9 @@
+using System;
+using System.Reflection;
+using System.Windows.Forms;
+using Microsoft.Win32;
+static class StartupOption {
+ const string Key="Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+ public static void Install(Form form){var tabs=form.Controls[0] as TabControl;if(tabs==null)return;var page=tabs.TabPages[0];foreach(Control c in page.Controls)if(c.Top>=130)c.Top+=26;var check=new CheckBox{Text="Запускать MintShot при входе в Windows",AutoSize=true,Location=new System.Drawing.Point(18,128)};try{using(var key=Registry.CurrentUser.OpenSubKey(Key))check.Checked=key!=null&&String.Equals(key.GetValue("MintShot") as string,"\""+Application.ExecutablePath+"\"",StringComparison.OrdinalIgnoreCase);}catch{}page.Controls.Add(check);var apply=form.GetType().GetField("Apply");var original=apply.GetValue(form);var preferences=apply.FieldType.GetGenericArguments()[0];var wrap=typeof(StartupOption).GetMethod("Wrap",BindingFlags.Static|BindingFlags.Public).MakeGenericMethod(preferences);apply.SetValue(form,wrap.Invoke(null,new object[]{original,check,form}));}
+ public static Func<T,bool> Wrap<T>(Func<T,bool> original,CheckBox check,Form form){return delegate(T draft){if(original!=null&&!original(draft))return false;try{using(var key=Registry.CurrentUser.CreateSubKey(Key)){if(check.Checked)key.SetValue("MintShot","\""+Application.ExecutablePath+"\"",RegistryValueKind.String);else key.DeleteValue("MintShot",false);}return true;}catch(Exception ex){MessageBox.Show(form,ex.Message,"Не удалось изменить автозагрузку");return false;}};}
+}

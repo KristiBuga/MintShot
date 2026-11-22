@@ -1,0 +1,628 @@
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+interface IMintSettingsInput
+{
+    void SetTheme(MintTheme theme);
+}
+
+static class MintSettingsInputs
+{
+    public static void Install(Panel page)
+    {
+        var bindings = new Panel { Visible = false, TabStop = false };
+        ReplaceChildren(page, bindings);
+        page.Controls.Add(bindings);
+    }
+
+    public static void StyleShortcuts(Panel page)
+    {
+        var controls = new Control[page.Controls.Count];
+        page.Controls.CopyTo(controls, 0);
+        int index = 0;
+        foreach (var control in controls)
+        {
+            var editor = control as TextBox;
+            if (editor == null) continue;
+            int order = page.Controls.GetChildIndex(editor);
+            var field = new MintShortcutField(editor, index++);
+            page.Controls.Add(field);
+            page.Controls.SetChildIndex(field, order);
+        }
+    }
+
+    static void ReplaceChildren(Control parent, Panel bindings)
+    {
+        var children = new Control[parent.Controls.Count];
+        parent.Controls.CopyTo(children, 0);
+        foreach (var original in children)
+        {
+            var combo = original as ComboBox;
+            var slider = original as TrackBar;
+            var check = original as CheckBox;
+            if (combo == null && slider == null && check == null)
+            {
+                ReplaceChildren(original, bindings);
+                continue;
+            }
+            Control input;
+            if (combo != null) input = new MintChoice(combo);
+            else if (slider != null) input = new MintQualitySlider(slider);
+            else input = new MintSwitch(check);
+            var bounds = original.Bounds;
+            var table = parent as TableLayoutPanel;
+            var cell = table == null ? new TableLayoutPanelCellPosition() : table.GetPositionFromControl(original);
+            int columnSpan = table == null ? 1 : table.GetColumnSpan(original);
+            int rowSpan = table == null ? 1 : table.GetRowSpan(original);
+            input.TabIndex = original.TabIndex;
+            input.Margin = original.Margin;
+            input.Anchor = original.Anchor;
+            input.Dock = check != null && table != null ? DockStyle.Fill : original.Dock;
+            input.Bounds = new Rectangle(bounds.X, bounds.Y - (combo != null && table == null ? 3 : 0),
+                bounds.Width, combo != null ? 30 : check != null && table != null ? 22 : 26);
+            if (check != null && table == null)
+            {
+                bool shortcutRow = HasShortcutEditor(parent);
+                input.SetBounds(bounds.X, bounds.Y + bounds.Height / 2 - 13, shortcutRow ? 268 : 416, 26);
+            }
+            bindings.Controls.Add(original);
+            if (table != null)
+            {
+                table.Controls.Add(input, cell.Column, cell.Row);
+                table.SetColumnSpan(input, columnSpan);
+                table.SetRowSpan(input, rowSpan);
+            }
+            else parent.Controls.Add(input);
+        }
+    }
+
+    static bool HasShortcutEditor(Control parent)
+    {
+        foreach (Control child in parent.Controls)
+            if (child is TextBox || child is MintShortcutField) return true;
+        return false;
+    }
+
+    public static void DrawFrame(Graphics graphics, Rectangle bounds, Color fill, Color outline)
+    {
+        if (bounds.Width < 2 || bounds.Height < 2) return;
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var shape = new GraphicsPath())
+        using (var brush = new SolidBrush(fill))
+        using (var pen = new Pen(outline))
+        {
+            QuickAccessOverlay.AddRounded(shape, bounds, 12);
+            graphics.FillPath(brush, shape);
+            graphics.DrawPath(pen, shape);
+        }
+    }
+}
+
+sealed class MintMenuStyleCard : Button, IMintSettingsInput
+{
+    readonly bool ring;
+    readonly int position;
+    readonly bool simplified;
+    static readonly string[] simplifiedIcons = { "pen", "marker", "arrow", "box", "blur", "text", "copy", "save" };
+    MintTheme theme = new MintTheme(false);
+    public bool Selected { get; set; }
+
+    public MintMenuStyleCard(string name, bool ring, int position = -1, bool simplified = false)
+    {
+        Text = name;
+        this.ring = ring;
+        this.position = position;
+        this.simplified = simplified;
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
+        AccessibleRole = AccessibleRole.RadioButton;
+    }
+
+    public void SetTheme(MintTheme value) { theme = value; Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(theme.Card);
+        MintSettingsInputs.DrawFrame(g, new Rectangle(1, 1, Width - 3, Height - 3),
+            theme.Surface, Selected || Focused ? theme.Accent : theme.Border);
+        using (var pen = new Pen(Selected ? theme.Accent : theme.Muted))
+        using (var active = new SolidBrush(theme.Accent))
+        using (var panel = new SolidBrush(theme.Card))
+        {
+            g.DrawEllipse(pen, 12, 12, 14, 14);
+            if (Selected) g.FillEllipse(active, 15, 15, 8, 8);
+            TextRenderer.DrawText(g, Text, Font, new Point(34, 11), theme.Text);
+            if (position >= 0)
+            {
+                var screen = new Rectangle(12, 38, Width - 25, Height - 48);
+                g.FillRectangle(panel, screen);
+                QuickAccessOverlay.DrawCorners(g, screen, theme.Accent);
+                bool vertical = position >= 2;
+                int iconSize = Math.Min(13, ((vertical ? screen.Height : screen.Width) - 8) / 4);
+                int length = iconSize * 4 + 4;
+                int thickness = iconSize + 4;
+                var dock = vertical
+                    ? new Rectangle(position == 2 ? screen.Left + 3 : screen.Right - thickness - 3,
+                        screen.Top + (screen.Height - length) / 2, thickness, length)
+                    : new Rectangle(screen.Left + (screen.Width - length) / 2,
+                        position == 1 ? screen.Top + 3 : screen.Bottom - thickness - 3, length, thickness);
+                MintSettingsInputs.DrawFrame(g, dock, theme.Surface, theme.Border);
+                string[] previewIcons = { "pen", "arrow", "box", "text" };
+                for (int i = 0; i < previewIcons.Length; i++)
+                {
+                    var icon = new Rectangle(dock.Left + 2 + (vertical ? 0 : i * iconSize),
+                        dock.Top + 2 + (vertical ? i * iconSize : 0), iconSize, iconSize);
+                    if (i == 0)
+                    {
+                        using (var brush = new SolidBrush(theme.Accent)) g.FillRectangle(brush, icon);
+                    }
+                    GeometricIcons.Draw(g, icon, previewIcons[i], i == 0 ? theme.Surface : theme.Text);
+                }
+                return;
+            }
+            var area = new Rectangle(Width / 6, 45, Width * 2 / 3, 52);
+            g.FillRectangle(panel, area);
+            QuickAccessOverlay.DrawCorners(g, area, theme.Accent);
+            if (ring)
+            {
+                var wheel = new Rectangle(area.Right - 24, area.Top - 13, 47, 47);
+                g.FillEllipse(panel, wheel);
+                g.DrawEllipse(pen, wheel);
+                g.DrawLine(pen, wheel.Left, wheel.Top + 23, wheel.Right, wheel.Top + 23);
+                g.DrawLine(pen, wheel.Left + 23, wheel.Top, wheel.Left + 23, wheel.Bottom);
+                g.FillEllipse(panel, wheel.Left + 15, wheel.Top + 15, 17, 17);
+                g.DrawEllipse(pen, wheel.Left + 15, wheel.Top + 15, 17, 17);
+                string[] icons = { "pen", "text", "box", "arrow" };
+                for (int i = 0; i < icons.Length; i++)
+                {
+                    double angle = (i * 90 - 45) * Math.PI / 180;
+                    int x = wheel.Left + 23 + (int)(Math.Cos(angle) * 16);
+                    int y = wheel.Top + 23 + (int)(Math.Sin(angle) * 16);
+                    GeometricIcons.Draw(g, new Rectangle(x - 7, y - 7, 14, 14), icons[i], theme.Text);
+                }
+            }
+            else if (simplified)
+            {
+                int cell = Math.Min(15, (Width - 14) / simplifiedIcons.Length);
+                if (cell < 4) return;
+                int width = cell * simplifiedIcons.Length + 4;
+                var dock = new Rectangle((Width - width) / 2, 103, width, 18);
+                MintSettingsInputs.DrawFrame(g, dock, theme.Card, theme.Border);
+                for (int i = 0; i < simplifiedIcons.Length; i++)
+                {
+                    var icon = new Rectangle(dock.X + 2 + i * cell, dock.Y + 1, cell, 16);
+                    if (i == 1) MintSettingsInputs.DrawFrame(g, icon, theme.Accent, theme.Accent);
+                    GeometricIcons.DrawSimplifiedTool(g, icon, simplifiedIcons[i], i == 1 ? theme.Surface : theme.Text);
+                }
+            }
+            else
+            {
+                var dock = new Rectangle(Width / 2 - 39, 103, 78, 18);
+                MintSettingsInputs.DrawFrame(g, dock, theme.Card, theme.Border);
+                string[] icons = { "pen", "arrow", "box", "text" };
+                for (int i = 0; i < icons.Length; i++)
+                    GeometricIcons.Draw(g, new Rectangle(dock.X + 3 + 18 * i, dock.Y, 17, 17), icons[i], theme.Text);
+            }
+        }
+    }
+}
+
+sealed class MintSwitch : CheckBox, IMintSettingsInput
+{
+    const int TransitionMilliseconds = 180;
+    readonly CheckBox source;
+    readonly Timer animation = new Timer { Interval = 15 };
+    readonly Stopwatch elapsed = new Stopwatch();
+    MintTheme theme = new MintTheme(false);
+    bool hovered;
+    float position, start, target;
+
+    public MintSwitch(CheckBox source)
+    {
+        this.source = source;
+        Text = source.Text;
+        AccessibleName = source.AccessibleName ?? source.Text;
+        Font = source.Font;
+        AutoSize = false;
+        FlatStyle = FlatStyle.Flat;
+        DoubleBuffered = true;
+        Checked = source.Checked;
+        Enabled = source.Enabled;
+        source.CheckedChanged += delegate { if (Checked != source.Checked) Checked = source.Checked; };
+        source.EnabledChanged += delegate { Enabled = source.Enabled; };
+        MouseEnter += delegate { hovered = true; Invalidate(); };
+        MouseLeave += delegate { hovered = false; Invalidate(); };
+        animation.Tick += delegate {
+            var progress = (float)Math.Min(1, elapsed.Elapsed.TotalMilliseconds / TransitionMilliseconds);
+            position = start + (target - start) * progress * progress * (3 - 2 * progress);
+            Invalidate();
+            if (progress >= 1) animation.Stop();
+        };
+    }
+
+    public void SetTheme(MintTheme value) { theme = value; Invalidate(); }
+
+    protected override void OnCheckedChanged(EventArgs e)
+    {
+        if (source != null && source.Checked != Checked) source.Checked = Checked;
+        target = Checked ? 1 : 0;
+        if (IsHandleCreated && Visible && SystemInformation.IsMenuAnimationEnabled)
+        {
+            start = position;
+            elapsed.Restart();
+            animation.Start();
+        }
+        else position = target;
+        Invalidate();
+        base.OnCheckedChanged(e);
+    }
+
+    static Color Blend(Color off, Color on, float amount)
+    {
+        return Color.FromArgb((int)Math.Round(off.R + (on.R - off.R) * amount),
+            (int)Math.Round(off.G + (on.G - off.G) * amount),
+            (int)Math.Round(off.B + (on.B - off.B) * amount));
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var graphics = e.Graphics;
+        var background = Parent == null ? theme.Card : Parent.BackColor;
+        graphics.Clear(background);
+        int y = (Height - 17) / 2;
+        var track = new Rectangle(Width - 38, y, 32, 17);
+        if (track.Left < 1) return;
+        float amount = Enabled ? position : 0;
+        Color fill = Blend(hovered ? theme.Hover : theme.Surface, theme.Accent, amount);
+        Color outline = Focused ? theme.Accent : Blend(theme.Border, theme.Accent, amount);
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var shape = new GraphicsPath())
+        using (var brush = new SolidBrush(fill))
+        using (var pen = new Pen(outline))
+        {
+            QuickAccessOverlay.AddRounded(shape, track, track.Height);
+            graphics.FillPath(brush, shape);
+            graphics.DrawPath(pen, shape);
+        }
+        using (var thumb = new SolidBrush(Blend(theme.Muted, theme.Surface, amount)))
+            graphics.FillEllipse(thumb, track.Left + 3 + 15 * position, y + 3, 11, 11);
+        TextRenderer.DrawText(graphics, Text, Font, new Rectangle(0, 0, track.Left - 6, Height),
+            Enabled ? theme.Text : theme.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) animation.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
+sealed class MintCloseButton : Button, IMintSettingsInput
+{
+    MintTheme theme = new MintTheme(false);
+    bool hovered;
+
+    public MintCloseButton()
+    {
+        AccessibleName = "Закрыть настройки";
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        DoubleBuffered = true;
+        MouseEnter += delegate { hovered = true; Invalidate(); };
+        MouseLeave += delegate { hovered = false; Invalidate(); };
+    }
+
+    public void SetTheme(MintTheme value) { theme = value; Invalidate(); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(Parent == null ? theme.Surface : Parent.BackColor);
+        bool highlighted = hovered || Focused;
+        if (highlighted)
+            MintSettingsInputs.DrawFrame(e.Graphics, new Rectangle(1, 1, Width - 3, Height - 3), theme.Hover, theme.Hover);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        QuickAccessOverlay.DrawIcon(e.Graphics, ClientRectangle, "close", highlighted ? theme.Accent : theme.Muted);
+    }
+}
+
+sealed class MintFolderField : Panel, IMintSettingsInput
+{
+    public readonly TextBox Editor;
+    public readonly Button Browse;
+    readonly FolderBrowseButton browse;
+    MintTheme theme = new MintTheme(false);
+
+    public MintFolderField()
+    {
+        DoubleBuffered = true;
+        Editor = new TextBox { BorderStyle = BorderStyle.None, AccessibleName = "Папка сохранения" };
+        browse = new FolderBrowseButton();
+        Browse = browse;
+        Controls.AddRange(new Control[] { Editor, Browse });
+        Editor.GotFocus += delegate { Invalidate(); };
+        Editor.LostFocus += delegate { Invalidate(); };
+        LayoutFields();
+    }
+
+    void LayoutFields()
+    {
+        const int buttonWidth = 91;
+        int right = Math.Max(31, Width - buttonWidth - 4);
+        Editor.SetBounds(32, Math.Max(0, (Height - Editor.PreferredHeight) / 2),
+            Math.Max(1, right - 42), Editor.PreferredHeight);
+        Browse.SetBounds(right, 4, buttonWidth, Math.Max(1, Height - 8));
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (Editor != null && Browse != null) LayoutFields();
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left) Editor.Focus();
+        base.OnMouseDown(e);
+    }
+
+    public void SetTheme(MintTheme value)
+    {
+        theme = value;
+        Editor.BackColor = theme.Surface;
+        Editor.ForeColor = theme.Text;
+        browse.SetTheme(value);
+        Invalidate();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(Parent == null ? theme.Card : Parent.BackColor);
+        MintSettingsInputs.DrawFrame(e.Graphics, new Rectangle(0, 0, Width - 1, Height - 1),
+            theme.Surface, Editor.Focused ? theme.Accent : theme.Border);
+        QuickAccessOverlay.DrawIcon(e.Graphics, new Rectangle(2, 1, 32, Height - 2), "folder", theme.Accent);
+        base.OnPaint(e);
+    }
+
+    sealed class FolderBrowseButton : Button
+    {
+        MintTheme theme = new MintTheme(false);
+        bool hovered;
+
+        public FolderBrowseButton()
+        {
+            Text = "Обзор…";
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            DoubleBuffered = true;
+            MouseEnter += delegate { hovered = true; Invalidate(); };
+            MouseLeave += delegate { hovered = false; Invalidate(); };
+        }
+
+        public void SetTheme(MintTheme value) { theme = value; Invalidate(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(theme.Surface);
+            MintSettingsInputs.DrawFrame(e.Graphics, new Rectangle(0, 0, Width - 1, Height - 1),
+                theme.Hover, Focused ? theme.Accent : theme.Hover);
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, hovered || Focused ? theme.Accent : theme.Text,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+    }
+}
+
+sealed class MintShortcutField : Panel, IMintSettingsInput
+{
+    public readonly TextBox Editor;
+    public readonly int Index;
+    MintTheme theme = new MintTheme(false);
+
+    public MintShortcutField(TextBox editor, int index)
+    {
+        Editor = editor;
+        Index = index;
+        var original = editor.Bounds;
+        Bounds = new Rectangle(original.X, original.Y + original.Height / 2 - 15, original.Width, 30);
+        Anchor = editor.Anchor;
+        TabIndex = editor.TabIndex;
+        TabStop = false;
+        DoubleBuffered = true;
+        editor.BorderStyle = BorderStyle.None;
+        editor.AccessibleName = index == 0 ? "Основная горячая клавиша" : "Быстрое сохранение всего экрана";
+        editor.Cursor = Cursors.Default;
+        editor.GotFocus += delegate { Invalidate(); };
+        editor.LostFocus += delegate { Invalidate(); };
+        editor.EnabledChanged += delegate { UpdateColors(); };
+        Controls.Add(editor);
+        LayoutEditor();
+    }
+
+    void LayoutEditor()
+    {
+        Editor.SetBounds(11, Math.Max(0, (Height - Editor.PreferredHeight) / 2), Math.Max(1, Width - 22), Editor.PreferredHeight);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (Editor != null) LayoutEditor();
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left && Editor.Enabled) Editor.Focus();
+        base.OnMouseDown(e);
+    }
+
+    public void SetTheme(MintTheme value) { theme = value; UpdateColors(); }
+
+    void UpdateColors()
+    {
+        Editor.BackColor = Editor.Enabled ? theme.Surface : theme.Card;
+        Invalidate();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var fill = Editor.Enabled ? theme.Surface : theme.Card;
+        e.Graphics.Clear(Parent == null ? theme.Card : Parent.BackColor);
+        MintSettingsInputs.DrawFrame(e.Graphics, new Rectangle(0, 0, Width - 1, Height - 1),
+            fill, Editor.Focused ? theme.Accent : theme.Border);
+        base.OnPaint(e);
+    }
+}
+
+sealed class MintChoice : Button, IMintSettingsInput
+{
+    readonly ComboBox source;
+    readonly ContextMenuStrip menu = new ContextMenuStrip();
+    MintTheme theme = new MintTheme(false);
+    bool over;
+
+    public MintChoice(ComboBox source)
+    {
+        this.source = source;
+        AccessibleRole = AccessibleRole.DropList;
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        source.SelectedIndexChanged += delegate { UpdateText(); };
+        source.EnabledChanged += delegate { Enabled = source.Enabled; };
+        Enabled = source.Enabled;
+        MouseEnter += delegate { over = true; Invalidate(); };
+        MouseLeave += delegate { over = false; Invalidate(); };
+        UpdateText();
+    }
+
+    void UpdateText()
+    {
+        Text = source.Text;
+        AccessibleName = String.IsNullOrEmpty(source.AccessibleName) ? source.Text : source.AccessibleName;
+        Invalidate();
+    }
+
+    public void SetTheme(MintTheme value) { theme = value; Invalidate(); }
+
+    protected override void OnClick(EventArgs e)
+    {
+        base.OnClick(e);
+        while (menu.Items.Count > 0) menu.Items[0].Dispose();
+        menu.Renderer = new MintTrayRenderer(theme);
+        menu.ShowImageMargin = false;
+        menu.ShowCheckMargin = false;
+        menu.MinimumSize = new Size(Width, 0);
+        menu.Padding = new Padding(2);
+        for (int i = 0; i < source.Items.Count; i++)
+        {
+            int index = i;
+            string label = source.GetItemText(source.Items[i]);
+            var item = new ToolStripMenuItem((i == source.SelectedIndex ? "✓  " : "     ") + label) {
+                AccessibleName = label, Padding = new Padding(5, 4, 8, 4),
+                AutoSize = false, Size = new Size(Math.Max(1, Width - menu.Padding.Horizontal), 30)
+            };
+            item.Click += delegate { source.SelectedIndex = index; };
+            menu.Items.Add(item);
+        }
+        if (menu.Items.Count != 0) menu.Show(this, new Point(0, Height + 3), ToolStripDropDownDirection.BelowRight);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var background = Parent == null ? theme.Card : Parent.BackColor;
+        e.Graphics.Clear(background);
+        MintSettingsInputs.DrawFrame(e.Graphics, new Rectangle(0, 0, Width - 1, Height - 1),
+            over && Enabled ? theme.Hover : theme.Surface, Focused ? theme.Accent : theme.Border);
+        TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(10, 0, Math.Max(1, Width - 35), Height),
+            Enabled ? theme.Text : theme.Muted, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        int x = Width - 16, y = Height / 2;
+        using (var pen = new Pen(Enabled ? theme.Accent : theme.Muted, 1.5f) { LineJoin = LineJoin.Round })
+            e.Graphics.DrawLines(pen, new[] { new Point(x - 4, y - 2), new Point(x, y + 2), new Point(x + 4, y - 2) });
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) menu.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
+sealed class MintQualitySlider : Control, IMintSettingsInput
+{
+    readonly TrackBar source;
+    MintTheme theme = new MintTheme(false);
+    int TrackLength { get { return Math.Max(1, Width - 26); } }
+
+    public MintQualitySlider(TrackBar source)
+    {
+        this.source = source;
+        SetStyle(ControlStyles.Selectable | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        TabStop = true;
+        AccessibleRole = AccessibleRole.Slider;
+        AccessibleName = "Качество JPEG";
+        Enabled = source.Enabled;
+        source.EnabledChanged += delegate { Enabled = source.Enabled; Invalidate(); };
+        source.ValueChanged += delegate { Invalidate(); };
+    }
+
+    public void SetTheme(MintTheme value) { theme = value; Invalidate(); }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        Focus();
+        Capture = true;
+        MoveThumb(e.X);
+    }
+    protected override void OnMouseMove(MouseEventArgs e) { if (Capture) MoveThumb(e.X); }
+    protected override void OnMouseUp(MouseEventArgs e) { if (e.Button == MouseButtons.Left) Capture = false; }
+
+    void MoveThumb(int x)
+    {
+        var fraction = Math.Max(0, Math.Min(1, (x - 13.0) / TrackLength));
+        SetValue(source.Minimum + (int)Math.Round(fraction * (source.Maximum - source.Minimum)));
+    }
+
+    void SetValue(int value) { source.Value = Math.Max(source.Minimum, Math.Min(source.Maximum, value)); }
+
+    protected override bool IsInputKey(Keys keyData)
+    {
+        var key = keyData & Keys.KeyCode;
+        return key == Keys.Left || key == Keys.Right || key == Keys.Home || key == Keys.End || base.IsInputKey(keyData);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Left) SetValue(source.Value - source.SmallChange);
+        else if (e.KeyCode == Keys.Right) SetValue(source.Value + source.SmallChange);
+        else if (e.KeyCode == Keys.Home) SetValue(source.Minimum);
+        else if (e.KeyCode == Keys.End) SetValue(source.Maximum);
+        else { base.OnKeyDown(e); return; }
+        e.Handled = true;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(Parent == null ? theme.Card : Parent.BackColor);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        int y = Height / 2;
+        int x = 13 + (source.Value - source.Minimum) * TrackLength / Math.Max(1, source.Maximum - source.Minimum);
+        var accent = Enabled ? theme.Accent : theme.Border;
+        using (var rail = new Pen(theme.Border, 4) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+        using (var fill = new Pen(accent, 4) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+        using (var thumb = new SolidBrush(accent))
+        {
+            e.Graphics.DrawLine(rail, 13, y, 13 + TrackLength, y);
+            if (x > 13) e.Graphics.DrawLine(fill, 13, y, x, y);
+            e.Graphics.FillEllipse(thumb, x - 6, y - 6, 12, 12);
+        }
+        if (Focused)
+            using (var ring = new Pen(theme.Accent)) e.Graphics.DrawEllipse(ring, x - 9, y - 9, 18, 18);
+    }
+}

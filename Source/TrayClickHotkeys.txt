@@ -1,0 +1,72 @@
+using System;
+using System.Reflection;
+using System.Windows.Forms;
+static class TrayClick {
+ public static void Install(Assembly core){var flags=BindingFlags.Public|BindingFlags.NonPublic;var threadType=typeof(Application).GetNestedType("ThreadContext",BindingFlags.NonPublic);var fromCurrent=threadType.GetMethod("FromCurrent",flags|BindingFlags.Static);var thread=fromCurrent.Invoke(null,null);var property=threadType.GetProperty("ApplicationContext",flags|BindingFlags.Instance);var context=property.GetValue(thread,null);InstallOn(context);}
+ public static void InstallOn(object context){
+  var flags=BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Instance;
+  var type=context.GetType();
+  var tray=(NotifyIcon)type.GetField("tray",flags).GetValue(context);
+  tray.Icon=AppBrand.Icon;
+  NotificationBrand.Install(type.Assembly,tray);
+  GlobalHotkeys.Install(context);
+  tray.MouseUp+=delegate(object sender,MouseEventArgs e){if(e.Button==MouseButtons.Left)CaptureDestination.OpenRegion(context,true);};
+  var busy=type.GetField("busy",flags);
+  var settings=type.GetField("settings",flags);
+  var menu=tray.ContextMenuStrip;
+  var oldCapture=menu.Items[0];
+  var captureItem=new ToolStripMenuItem(oldCapture.Text);
+  captureItem.Click+=delegate{CaptureDestination.OpenRegion(context,true);};
+  menu.Items.Remove(oldCapture);
+  oldCapture.Dispose();
+  menu.Items.Insert(0,captureItem);
+  var oldSettings=menu.Items[1];
+  var settingsItem=new ToolStripMenuItem(oldSettings.Text);
+  settingsItem.Click+=delegate{ShowSettings(context,settings);};
+  menu.Items.Remove(oldSettings);
+  oldSettings.Dispose();
+  menu.Items.Insert(1,settingsItem);
+  new UpdateService((ApplicationContext)context,menu,delegate{return (bool)busy.GetValue(context)||settings.GetValue(context)!=null;});
+#if ABOUT_PREVIEW
+  ToolStripItem about = null;
+  foreach (ToolStripItem item in menu.Items)
+   if (item.Text.Replace("&","").StartsWith("О программе", StringComparison.OrdinalIgnoreCase)) { about = item; break; }
+  var aboutItem = new ToolStripMenuItem("О программе…");
+  aboutItem.Click += delegate {
+   using (var dialog = new Form { FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterScreen,
+    MaximizeBox = false, MinimizeBox = false, ShowInTaskbar = false, Icon = AppBrand.Icon })
+   {
+    MintAbout.Style(dialog);
+    dialog.ShowDialog();
+   }
+  };
+  int aboutIndex = about == null ? 3 : menu.Items.IndexOf(about);
+  if (about != null)
+  {
+   menu.Items.Remove(about);
+   about.Dispose();
+  }
+  menu.Items.Insert(aboutIndex, aboutItem);
+#endif
+  MintTrayRenderer.Install(menu);
+ }
+
+ static void ShowSettings(object context, FieldInfo settings)
+ {
+  var existing = settings.GetValue(context) as Form;
+  if(existing != null) { existing.Activate(); return; }
+  using(var dialog = (Form)Activator.CreateInstance(settings.FieldType))
+  {
+   settings.SetValue(context,dialog);
+   try
+   {
+    var apply=dialog.GetType().GetField("Apply");
+    var callback=context.GetType().GetMethod("<Settings>b__f",BindingFlags.NonPublic|BindingFlags.Instance);
+    apply.SetValue(dialog,Delegate.CreateDelegate(apply.FieldType,context,callback));
+    AppBrand.Apply(dialog);
+    dialog.ShowDialog();
+   }
+   finally { settings.SetValue(context,null); }
+  }
+ }
+}

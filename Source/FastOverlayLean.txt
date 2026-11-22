@@ -1,0 +1,298 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+class NativeSurface:IDisposable {
+ [DllImport("gdi32.dll")]static extern IntPtr CreateCompatibleDC(IntPtr dc);
+ [DllImport("gdi32.dll")]static extern IntPtr SelectObject(IntPtr dc,IntPtr obj);
+ [DllImport("gdi32.dll")]static extern bool DeleteObject(IntPtr obj);
+ [DllImport("gdi32.dll")]static extern bool DeleteDC(IntPtr dc);
+ public readonly IntPtr Dc;readonly IntPtr image,previous;
+ public NativeSurface(Bitmap b){Dc=CreateCompatibleDC(IntPtr.Zero);image=b.GetHbitmap();previous=SelectObject(Dc,image);if(Dc==IntPtr.Zero||image==IntPtr.Zero)throw new InvalidOperationException("Cannot create drawing buffer");}
+ public void Dispose(){SelectObject(Dc,previous);DeleteObject(image);DeleteDC(Dc);}
+}
+class FastOverlay:IDisposable {
+ [DllImport("gdi32.dll")]static extern bool BitBlt(IntPtr dst,int x,int y,int w,int h,IntPtr src,int sx,int sy,uint op);
+ [StructLayout(LayoutKind.Sequential)]public struct PaintInfo {public IntPtr dc;public int erase;public int left,top,right,bottom;public int restore,update;[MarshalAs(UnmanagedType.ByValArray,SizeConst=32)]public byte[] reserved;}
+ [DllImport("user32.dll")]static extern IntPtr BeginPaint(IntPtr h,out PaintInfo info);
+ [DllImport("user32.dll")]static extern bool EndPaint(IntPtr h,ref PaintInfo info);
+ Rectangle previous;bool ready,previousVisible,previousInk;
+ readonly Size frameSize;readonly Form form;readonly Bitmap shot,dim,frame;readonly NativeSurface shotSurface,dimSurface,frameSurface;readonly Graphics buffer;readonly FieldInfo selection,selected,mode,marks,active;readonly MethodInfo draw;readonly Font font=new Font("Segoe UI",9);
+ readonly FieldInfo markTool, markStart, markEnd, markWidth, markPoints;
+ readonly FieldInfo currentTool;
+ readonly MethodInfo render, resizeHandles;
+ object movingBlur;
+ object selectedBlur;
+ int newBlurStrength = CaptureBlur.DefaultStrength;
+ Point dragOrigin, originalBlurStart, originalBlurEnd;
+ Rectangle dragBlurBounds;
+ public FastOverlay(Form f){form=f;var t=f.GetType();var flags=BindingFlags.NonPublic|BindingFlags.Instance;shot=(Bitmap)t.GetField("shot",flags).GetValue(f);frameSize=shot.Size;selection=t.GetField("selection",flags);selected=t.GetField("selected",flags);mode=t.GetField("mode",flags);marks=t.GetField("marks",flags);active=t.GetField("active",flags);draw=t.GetMethod("Draw",flags);render=t.GetMethod("Render", flags | BindingFlags.Public);
+ var markType = active.FieldType;
+ currentTool = t.GetField("tool", flags);
+ resizeHandles = t.GetMethod("Handles", flags);
+ markTool = markType.GetField("Tool");
+ markStart = markType.GetField("A");
+ markWidth = markType.GetField("Width");
+ markPoints = markType.GetField("Points");
+ markEnd = markType.GetField("B");t.GetField("tool",flags).SetValue(f,"");t.GetMethod("UpdateTools",flags).Invoke(f,null);dim=new Bitmap(shot.Width,shot.Height,System.Drawing.Imaging.PixelFormat.Format32bppPArgb);using(var g=Graphics.FromImage(dim)){g.DrawImageUnscaled(shot,0,0);using(var b=new SolidBrush(Color.FromArgb(160,9,13,20)))g.FillRectangle(b,0,0,dim.Width,dim.Height);}frame=new Bitmap(dim.Width,dim.Height,System.Drawing.Imaging.PixelFormat.Format32bppPArgb);shotSurface=new NativeSurface(shot);dimSurface=new NativeSurface(dim);frameSurface=new NativeSurface(frame);buffer=Graphics.FromHdc(frameSurface.Dc);dim.Dispose();frame.Dispose();}
+ public bool DefaultMove(Point p){var field=form.GetType().GetField("tool",BindingFlags.NonPublic|BindingFlags.Instance);if((string)field.GetValue(form)!=""||!(bool)selected.GetValue(form)||!((Rectangle)selection.GetValue(form)).Contains(p))return false;field.SetValue(form,"Область");return true;}
+ public void EndDefaultMove(){form.GetType().GetField("tool",BindingFlags.NonPublic|BindingFlags.Instance).SetValue(form,"");}
+ public void StartAt(Point p){if(!(bool)selected.GetValue(form))return;var r=(Rectangle)selection.GetValue(form);r.Inflate(8,8);if(r.Contains(p))return;selected.SetValue(form,false);((IList)marks.GetValue(form)).Clear();var flags=BindingFlags.NonPublic|BindingFlags.Instance;((Control)form.GetType().GetField("tools",flags).GetValue(form)).Hide();((Control)form.GetType().GetField("actions",flags).GetValue(form)).Hide();}
+
+ public bool IsMovingBlur { get { return movingBlur != null; } }
+
+ public bool TryStartBlurMove(Point point)
+ {
+  var mark = FindBlur(point);
+  if (mark == null) return false;
+  dragOrigin = point;
+  originalBlurStart = (Point)markStart.GetValue(mark);
+  originalBlurEnd = (Point)markEnd.GetValue(mark);
+  dragBlurBounds = BlurBounds(mark, (Rectangle)selection.GetValue(form));
+  movingBlur = mark;
+  selectedBlur = mark;
+  form.Capture = true;
+  form.Cursor = Cursors.SizeAll;
+  return true;
+ }
+
+ public void MoveBlur(Point point)
+ {
+  var area = (Rectangle)selection.GetValue(form);
+  int x = Math.Max(area.Left, Math.Min(area.Right - dragBlurBounds.Width,
+   dragBlurBounds.X + point.X - dragOrigin.X));
+  int y = Math.Max(area.Top, Math.Min(area.Bottom - dragBlurBounds.Height,
+   dragBlurBounds.Y + point.Y - dragOrigin.Y));
+  if (x == dragBlurBounds.X && y == dragBlurBounds.Y)
+  {
+   markStart.SetValue(movingBlur, originalBlurStart);
+   markEnd.SetValue(movingBlur, originalBlurEnd);
+   return;
+  }
+  markStart.SetValue(movingBlur, new Point(x, y));
+  markEnd.SetValue(movingBlur, new Point(x + dragBlurBounds.Width, y + dragBlurBounds.Height));
+ }
+
+ public void EndBlurMove(bool cancel)
+ {
+  if (cancel)
+  {
+   markStart.SetValue(movingBlur, originalBlurStart);
+   markEnd.SetValue(movingBlur, originalBlurEnd);
+  }
+  movingBlur = null;
+  form.Capture = false;
+  form.Cursor = Cursors.Cross;
+ }
+
+ public void UpdateBlurCursor(Point point)
+ {
+  if (FindBlur(point) != null) form.Cursor = Cursors.SizeAll;
+ }
+
+ public void InitializeBlur()
+ {
+  var mark = active.GetValue(form);
+  if (mark == null || !IsBlur(mark)) return;
+  markWidth.SetValue(mark, newBlurStrength);
+  selectedBlur = mark;
+ }
+
+ object SelectedBlur
+ {
+  get
+  {
+   if (selectedBlur != null && !((IList)marks.GetValue(form)).Contains(selectedBlur))
+    selectedBlur = null;
+   return selectedBlur;
+  }
+ }
+
+ public int BlurStrength
+ {
+  get
+  {
+   var mark = SelectedBlur;
+   return mark == null ? newBlurStrength : (int)markWidth.GetValue(mark);
+  }
+  set
+  {
+   var mark = SelectedBlur;
+   bool repaint = mark != null && (int)markWidth.GetValue(mark) != value;
+   if (repaint) markWidth.SetValue(mark, value);
+   newBlurStrength = value;
+   if (repaint) form.Invalidate();
+  }
+ }
+
+ object FindBlur(Point point)
+ {
+  if ((string)currentTool.GetValue(form) != CaptureBlur.ToolName ||
+      !(bool)selected.GetValue(form) || (int)mode.GetValue(form) != 0) return null;
+  var area = (Rectangle)selection.GetValue(form);
+  if (!area.Contains(point)) return null;
+  var items = (IList)marks.GetValue(form);
+  for (int i = items.Count - 1; i >= 0; i--)
+  {
+   var mark = items[i];
+   if (!IsBlur(mark) || !BlurBounds(mark, area).Contains(point)) continue;
+   foreach (var handle in (Point[])resizeHandles.Invoke(form, null))
+    if (new Rectangle(handle.X - 7, handle.Y - 7, 14, 14).Contains(point)) return null;
+   return mark;
+  }
+  return null;
+ }
+ public void Render(Graphics target){RenderNative();IntPtr dc=target.GetHdc();try{BitBlt(dc,0,0,frameSize.Width,frameSize.Height,frameSurface.Dc,0,0,0x00CC0020);}finally{target.ReleaseHdc(dc);}}
+ public void PaintBackdrop(Graphics target,Rectangle bounds){
+  if(!ready)RenderNative();
+  IntPtr dc=target.GetHdc();
+  try{BitBlt(dc,0,0,bounds.Width,bounds.Height,frameSurface.Dc,bounds.X,bounds.Y,0x00CC0020);}
+  finally{target.ReleaseHdc(dc);}
+ }
+ void RenderNative(bool showInterface = true){
+ var r=(Rectangle)selection.GetValue(form);bool visible=((bool)selected.GetValue(form)||(int)mode.GetValue(form)==1)&&r.Width>0&&r.Height>0;
+ var items=(IList)marks.GetValue(form);var currentMark=active.GetValue(form);Region dirty=null;
+ if(ready&&!previousInk&&items.Count==0&&currentMark==null){dirty=new Region();dirty.MakeEmpty();if(previousVisible)dirty.Union(previous);if(visible){if(previousVisible)dirty.Xor(r);else dirty.Union(r);}if(previousVisible)Edges(dirty,previous);if(visible)Edges(dirty,r);}
+ buffer.Flush(FlushIntention.Sync);
+ if(dirty==null){BitBlt(frameSurface.Dc,0,0,frameSize.Width,frameSize.Height,dimSurface.Dc,0,0,0x00CC0020);if(visible)BitBlt(frameSurface.Dc,r.X,r.Y,r.Width,r.Height,shotSurface.Dc,r.X,r.Y,0x00CC0020);}
+ else {using(var matrix=new Matrix()){foreach(var rect in dirty.GetRegionScans(matrix)){var part=Rectangle.Intersect(Rectangle.Ceiling(rect),new Rectangle(0,0,frameSize.Width,frameSize.Height));if(part.IsEmpty)continue;BitBlt(frameSurface.Dc,part.X,part.Y,part.Width,part.Height,dimSurface.Dc,part.X,part.Y,0x00CC0020);if(visible){var inside=Rectangle.Intersect(part,r);if(!inside.IsEmpty)BitBlt(frameSurface.Dc,inside.X,inside.Y,inside.Width,inside.Height,shotSurface.Dc,inside.X,inside.Y,0x00CC0020);}}}buffer.SetClip(dirty,CombineMode.Replace);}
+ ready=true;previousInk=items.Count>0||currentMark!=null;previous=r;previousVisible=visible;var g=buffer;g.SmoothingMode=SmoothingMode.None;
+ if(!visible){buffer.ResetClip();if(dirty!=null)dirty.Dispose();return;}
+ var state=g.Save();
+ g.SetClip(r,CombineMode.Intersect);
+ foreach(var mark in items) DrawMark(mark, r);
+ if(showInterface)
+ {
+  if(currentMark != null) DrawMark(currentMark, r);
+  if((string)currentTool.GetValue(form) == CaptureBlur.ToolName)
+  {
+   var highlighted = currentMark ?? SelectedBlur;
+   if(highlighted != null && IsBlur(highlighted)) DrawBlurOutline(BlurBounds(highlighted, r));
+  }
+ }
+ g.Restore(state);
+ if(showInterface)
+ {
+  QuickAccessOverlay.DrawCorners(g,r,Color.FromArgb(143,239,180));
+  DrawDimensions(g,r);
+ }
+ g.Flush(System.Drawing.Drawing2D.FlushIntention.Sync);g.ResetClip();if(dirty!=null)dirty.Dispose();}
+ public bool HasBlur
+ {
+  get
+  {
+   var current = active.GetValue(form);
+   if (current != null && IsBlur(current)) return true;
+   foreach (var mark in (IList)marks.GetValue(form))
+    if (IsBlur(mark)) return true;
+   return false;
+  }
+ }
+
+ public Bitmap RenderSelection()
+ {
+  if (!RequiresCustomRender) return (Bitmap)render.Invoke(form, null);
+  var area = (Rectangle)selection.GetValue(form);
+  try
+  {
+   RenderNative(false);
+   return ReadFrame(area);
+  }
+  finally
+  {
+   ready = false;
+   form.Invalidate();
+  }
+ }
+
+ public bool RequiresCustomRender
+ {
+  get
+  {
+   var current = active.GetValue(form);
+   if (current != null && (IsBlur(current) || IsMarker(current))) return true;
+   foreach (var mark in (IList)marks.GetValue(form))
+    if (IsBlur(mark) || IsMarker(mark)) return true;
+   return false;
+  }
+ }
+
+ bool IsBlur(object mark) { return (string)markTool.GetValue(mark) == CaptureBlur.ToolName; }
+ bool IsMarker(object mark) { return (string)markTool.GetValue(mark) == CaptureMarker.ToolName; }
+
+ Rectangle BlurBounds(object mark, Rectangle selectionArea)
+ {
+  var start = (Point)markStart.GetValue(mark);
+  var end = (Point)markEnd.GetValue(mark);
+  return Rectangle.Intersect(selectionArea, Rectangle.FromLTRB(
+   Math.Min(start.X, end.X), Math.Min(start.Y, end.Y),
+   Math.Max(start.X, end.X), Math.Max(start.Y, end.Y)));
+ }
+
+ void DrawMark(object mark, Rectangle selectionArea)
+ {
+  if (IsMarker(mark))
+  {
+   CaptureMarker.Draw(buffer, (Point)markStart.GetValue(mark), (List<Point>)markPoints.GetValue(mark),
+    (int)markWidth.GetValue(mark));
+   return;
+  }
+  if (!IsBlur(mark))
+  {
+   draw.Invoke(form, new object[] { buffer, mark });
+   return;
+  }
+  var area = BlurBounds(mark, selectionArea);
+  if (area.Width <= 0 || area.Height <= 0) return;
+  buffer.Flush(FlushIntention.Sync);
+  using (var source = ReadFrame(area))
+   CaptureBlur.Draw(buffer, area, source, (int)markWidth.GetValue(mark));
+ }
+
+ void DrawBlurOutline(Rectangle area)
+ {
+  if (area.Width <= 0 || area.Height <= 0) return;
+  using (var pen = new Pen(Color.FromArgb(143, 239, 180)))
+   buffer.DrawRectangle(pen, area.X, area.Y, area.Width - 1, area.Height - 1);
+ }
+
+ Bitmap ReadFrame(Rectangle area)
+ {
+  var image = new Bitmap(area.Width, area.Height);
+  try
+  {
+   using (var graphics = Graphics.FromImage(image))
+   {
+    var dc = graphics.GetHdc();
+    try
+    {
+     if (!BitBlt(dc, 0, 0, area.Width, area.Height, frameSurface.Dc, area.X, area.Y, 0x00CC0020))
+      throw new InvalidOperationException("Не удалось получить изображение с разметкой.");
+    }
+    finally { graphics.ReleaseHdc(dc); }
+   }
+   return image;
+  }
+  catch { image.Dispose(); throw; }
+ }
+
+ void DrawDimensions(Graphics graphics,Rectangle area){
+  string text=area.Width+" × "+area.Height;
+  int width=(int)Math.Ceiling(graphics.MeasureString(text,font).Width)+14;
+  var box=new Rectangle(Math.Min(area.Left,Math.Max(0,frameSize.Width-width)),Math.Max(0,area.Top-25),width,22);
+  bool light=QuickAccessSettings.Current.Light;
+  graphics.SmoothingMode=SmoothingMode.AntiAlias;
+  using(var path=new GraphicsPath()){
+   QuickAccessOverlay.AddRounded(path,box,10);
+   using(var brush=new SolidBrush(light?Color.FromArgb(245,251,247):Color.FromArgb(17,24,21)))graphics.FillPath(brush,path);
+  }
+  graphics.DrawString(text,font,light?Brushes.Black:Brushes.White,box.Left+7,box.Top+3);
+ }
+ void Edges(Region dirty,Rectangle r){dirty.Union(new Rectangle(r.Left-4,r.Top-4,r.Width+9,9));dirty.Union(new Rectangle(r.Left-4,r.Bottom-4,r.Width+9,9));dirty.Union(new Rectangle(r.Left-4,r.Top-4,9,r.Height+9));dirty.Union(new Rectangle(r.Right-4,r.Top-4,9,r.Height+9));int left=Math.Min(r.Left,Math.Max(0,frameSize.Width-164));dirty.Union(new Rectangle(left,Math.Max(0,r.Top-26),Math.Max(164,r.Left-left+164),27));}
+ public void Paint(IntPtr hwnd){PaintInfo p;IntPtr dc=BeginPaint(hwnd,out p);try{RenderNative();BitBlt(dc,p.left,p.top,p.right-p.left,p.bottom-p.top,frameSurface.Dc,p.left,p.top,0x00CC0020);}finally{EndPaint(hwnd,ref p);}}
+ public void Dispose(){buffer.Dispose();frameSurface.Dispose();dimSurface.Dispose();shotSurface.Dispose();frame.Dispose();dim.Dispose();font.Dispose();}
+}

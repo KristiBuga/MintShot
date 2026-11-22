@@ -1,0 +1,969 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Linq;
+using System.Reflection;
+using System.Windows.Forms;
+
+sealed class QuickAccessOverlay : IDisposable
+{
+    const BindingFlags Fields = BindingFlags.Instance | BindingFlags.NonPublic;
+    static readonly MethodInfo Click = typeof(Button).GetMethod("OnClick", Fields);
+    static readonly string[] Icons = { "move", "pen", "line", "arrow", "box", "text", "color", "undo" };
+    static readonly string[] SimplifiedTools = { "pen", "arrow", "box", "text" };
+    readonly Form form;
+    readonly FastOverlay painter;
+    readonly EditorHistory history;
+    readonly Action commitText;
+    readonly FieldInfo selection, selected, mode, tool, stroke, color;
+    readonly Control legacyTools, legacyActions;
+    readonly Bar tools, actions, orbit;
+    readonly IList marks;
+    readonly Item copy, save, reset, close;
+    ContextMenuStrip captureMenu;
+    ToolStripMenuItem clearMarkup;
+    ContextMenuStrip penOptions;
+    readonly QuickAccessSettings settings = QuickAccessSettings.Current;
+    readonly List<Item> entries = new List<Item>();
+    readonly int unit;
+
+    sealed class Item
+    {
+        public string Icon, Name, Tool;
+        public Action Invoke;
+    }
+
+    public QuickAccessOverlay(Form form, FastOverlay painter, EditorHistory history, Action commitText)
+    {
+        this.form = form;
+        this.painter = painter;
+        this.history = history;
+        this.commitText = commitText;
+        var type = form.GetType();
+        selection = type.GetField("selection", Fields);
+        selected = type.GetField("selected", Fields);
+        mode = type.GetField("mode", Fields);
+        tool = type.GetField("tool", Fields);
+        stroke = type.GetField("stroke", Fields);
+        color = type.GetField("color", Fields);
+        marks = (IList)type.GetField("marks", Fields).GetValue(form);
+        legacyTools = (Control)type.GetField("tools", Fields).GetValue(form);
+        legacyActions = (Control)type.GetField("actions", Fields).GetValue(form);
+        using (var graphics = form.CreateGraphics()) unit = Math.Max(30, Math.Min(52, (int)Math.Round(34 * graphics.DpiX / 96)));
+        var buttons = (IDictionary)type.GetField("toolButtons", Fields).GetValue(form);
+        bool simplifiedPanel = settings.SimplifiedPanel && !settings.Circle;
+        for (int i = 0; i < Icons.Length; i++)
+        {
+            if (i == 2 && (settings.Marker || simplifiedPanel))
+                entries.Add(AnnotationTool("marker", CaptureMarker.ToolName));
+            if (i == 5 && (settings.Blur || simplifiedPanel))
+                entries.Add(AnnotationTool("blur", CaptureBlur.ToolName));
+            if (simplifiedPanel ? !SimplifiedTools.Contains(Icons[i]) : (settings.Tools & (1 << i)) == 0)
+                continue;
+            var button = (Button)legacyTools.Controls[i];
+            var item = FromButton(button, Icons[i], QuickAccessSettings.ToolNames[i], buttons[button] as string);
+            if (item.Icon == "undo") item.Invoke = delegate { ChangeHistory(false); };
+            entries.Add(item);
+        }
+        copy = FromButton((Button)legacyActions.Controls[2], "copy", "Копировать", null);
+        var copyOriginal = copy.Invoke;
+        copy.Invoke = delegate {
+            if (painter.RequiresCustomRender) CaptureDestination.CopyRegion(form, painter.RenderSelection);
+            else copyOriginal();
+        };
+        save = new Item { Icon = "save", Name = "Сохранить", Invoke = SaveSelection };
+        reset = FromButton((Button)legacyActions.Controls[4], "reset", "Выделить заново", null);
+        var resetOriginal = reset.Invoke;
+        reset.Invoke = delegate { resetOriginal(); history.Reset(); };
+        close = FromButton((Button)legacyActions.Controls[5], "close", "Закрыть", null);
+        var commands = simplifiedPanel ? new[] { copy, save } : new[] { copy, save, reset, close };
+        var trigger = new Item { Icon = "circle", Name = "Инструменты и действия", Invoke = OpenCircle };
+        tools = new Bar(this, settings.Circle ? new List<Item> { trigger } : entries.Concat(commands).ToList(), settings.Circle, false);
+        actions = new Bar(this, new List<Item>(), false, false);
+        orbit = new Bar(this, entries.Concat(commands).ToList(), false, true);
+        form.Controls.AddRange(new Control[] { tools, actions, orbit });
+        tools.BringToFront();
+        actions.BringToFront();
+        orbit.BringToFront();
+        Sync();
+    }
+
+    Item AnnotationTool(string icon, string name)
+    {
+        return new Item { Icon = icon, Name = name, Tool = name, Invoke = delegate {
+            tool.SetValue(form, name);
+            form.Cursor = Cursors.Cross;
+        }};
+    }
+
+    Item FromButton(Button button, string icon, string name, string value)
+    {
+        return new Item { Icon = icon, Name = name, Tool = value, Invoke = delegate {
+            Click.Invoke(button, new object[] { EventArgs.Empty });
+        }};
+    }
+
+    static int Fit(int value, int low, int high) { return Math.Max(low, Math.Min(value, high)); }
+
+    public void CopySelection() { copy.Invoke(); }
+    public void SaveSelection() { CaptureDestination.SaveRegion(form, painter.RenderSelection); }
+    public void RefreshSlider() { actions.Invalidate(); orbit.Invalidate(); }
+
+    public void ChangeHistory(bool redo)
+    {
+        commitText();
+        if (!(redo ? history.Redo() : history.Undo())) return;
+        RefreshSlider();
+        form.Invalidate();
+    }
+
+    void ShowPenSmoothing(Point point)
+    {
+        if (penOptions != null) penOptions.Dispose();
+        var theme = new MintTheme(settings.Light);
+        bool matchPanel = !settings.Circle && tools.Width > tools.Height;
+        int popupWidth = matchPanel ? tools.Width : 247;
+        int contentWidth = popupWidth - 2;
+        var panel = new Panel { Size = new Size(contentWidth, 80), BackColor = theme.Card, ForeColor = theme.Text };
+        var title = new Label { Text = "Сглаживание пера", AutoEllipsis = true,
+            Bounds = new Rectangle(10, 6, contentWidth - 20, 16) };
+        var titleFont = new Font(form.Font, FontStyle.Bold);
+        title.Font = titleFont;
+        panel.Disposed += delegate { titleFont.Dispose(); };
+        var enabled = new CheckBox { Checked = settings.PenSmoothing };
+        var value = new TrackBar {
+            Minimum = 0, Maximum = 100,
+            Value = Math.Max(0, Math.Min(100, settings.PenSmoothingStrength)), Enabled = enabled.Checked
+        };
+        var toggle = new MintSwitch(enabled) { Bounds = new Rectangle(contentWidth - 54, 23, 44, 24), AccessibleName = "Стабилизация" };
+        var stabilization = new Label { Text = "Стабилизация", AutoEllipsis = true,
+            Bounds = new Rectangle(10, 29, contentWidth - 66, 16) };
+        stabilization.Click += delegate { toggle.Checked = !toggle.Checked; };
+        var slider = new MintQualitySlider(value) { Bounds = new Rectangle(62, 48, Math.Max(26, contentWidth - 106), 24),
+            AccessibleName = "Сила сглаживания пера" };
+        var percentage = new Label { Text = value.Value + "%", AutoSize = true, Location = new Point(contentWidth - 42, 54) };
+        bool originalEnabled = settings.PenSmoothing;
+        int originalStrength = settings.PenSmoothingStrength;
+        var label = new Label { Text = "Сила, %", AutoSize = true, Location = new Point(10, 54) };
+        toggle.SetTheme(theme);
+        slider.SetTheme(theme);
+        enabled.CheckedChanged += delegate { settings.PenSmoothing = enabled.Checked; value.Enabled = enabled.Checked; };
+        value.ValueChanged += delegate { settings.PenSmoothingStrength = value.Value; percentage.Text = value.Value + "%"; };
+        panel.Controls.AddRange(new Control[] { title, stabilization, toggle, slider, label, percentage });
+        stabilization.BringToFront();
+        panel.Disposed += delegate { enabled.Dispose(); value.Dispose(); };
+        penOptions = new ContextMenuStrip {
+            ShowImageMargin = false, ShowCheckMargin = false,
+            Padding = new Padding(1)
+        };
+        penOptions.Items.Add(new ToolStripControlHost(panel) { AutoSize = false, Size = panel.Size, Margin = Padding.Empty, Padding = Padding.Empty });
+        MintTrayRenderer.StyleMenu(penOptions);
+        int extraWidth = penOptions.GetPreferredSize(Size.Empty).Width - popupWidth;
+        if (extraWidth != 0)
+        {
+            contentWidth -= extraWidth;
+            panel.Width = contentWidth;
+            title.Width = contentWidth - 20;
+            toggle.Left = contentWidth - 54;
+            stabilization.Width = contentWidth - 66;
+            slider.Width = Math.Max(26, contentWidth - 106);
+            percentage.Left = contentWidth - 42;
+            penOptions.Items[0].Size = panel.Size;
+        }
+        penOptions.Closed += delegate {
+            if (settings.PenSmoothing == originalEnabled && settings.PenSmoothingStrength == originalStrength) return;
+            try { QuickAccessSettings.SavePenSmoothing(); }
+            catch (Exception error) { MessageBox.Show(form, error.Message, "Не удалось сохранить настройки пера"); }
+        };
+        penOptions.PerformLayout();
+        if (!settings.Circle)
+        {
+            var anchor = form.PointToScreen(tools.Location);
+            var screen = Screen.FromPoint(anchor).Bounds;
+            var size = penOptions.GetPreferredSize(Size.Empty);
+            int left = Fit(anchor.X, screen.Left, screen.Right - size.Width);
+            int top = anchor.Y - size.Height - 14;
+            if (top < screen.Top) top = anchor.Y + tools.Height + 14;
+            point = new Point(left, Fit(top, screen.Top, screen.Bottom - size.Height));
+        }
+        penOptions.Show(point);
+    }
+
+    public bool CanOpenCaptureMenu(Point point)
+    {
+        return (int)mode.GetValue(form) == 0 && (bool)selected.GetValue(form) &&
+            ((Rectangle)selection.GetValue(form)).Contains(point);
+    }
+
+    public void OpenCaptureMenu(Point point)
+    {
+        CloseCircle();
+        if (captureMenu == null)
+        {
+            captureMenu = new ContextMenuStrip();
+            AddMenuItem(copy.Name, copy.Icon, Keys.Control | Keys.C, copy.Invoke);
+            AddMenuItem(save.Name, save.Icon, Keys.Control | Keys.S, save.Invoke);
+            captureMenu.Items.Add(new ToolStripSeparator());
+            AddMenuItem("Выделить весь экран", "capture-corners", Keys.Control | Keys.A, SelectWholeScreen);
+            clearMarkup = AddMenuItem("Очистить разметку", "clear-markup", Keys.None, delegate {
+                marks.Clear();
+                history.Record();
+            });
+            AddMenuItem(reset.Name, reset.Icon, Keys.None, reset.Invoke);
+            captureMenu.Items.Add(new ToolStripSeparator());
+            AddMenuItem(close.Name, close.Icon, Keys.None, close.Invoke).ShortcutKeyDisplayString = "Esc";
+            MintTrayRenderer.StyleMenu(captureMenu);
+        }
+        clearMarkup.Enabled = marks.Count != 0;
+        captureMenu.Show(form, point);
+    }
+
+    ToolStripMenuItem AddMenuItem(string label, string icon, Keys shortcut, Action run)
+    {
+        var item = new ToolStripMenuItem(label) { Tag = icon, ShortcutKeys = shortcut };
+        item.Click += delegate {
+            captureMenu.Close();
+            run();
+            if (!form.IsDisposed)
+            {
+                Sync();
+                form.Invalidate();
+            }
+        };
+        captureMenu.Items.Add(item);
+        return item;
+    }
+
+    public void SelectWholeScreen()
+    {
+        selection.SetValue(form, form.ClientRectangle);
+        selected.SetValue(form, true);
+        Sync();
+        form.Invalidate();
+    }
+
+    public void Sync()
+    {
+        if (form.IsDisposed || tools.IsDisposed) return;
+        legacyTools.Hide();
+        legacyActions.Hide();
+        bool show = (bool)selected.GetValue(form) && (int)mode.GetValue(form) == 0;
+        if (!show)
+        {
+            tools.Hide();
+            actions.Hide();
+            orbit.Hide();
+            return;
+        }
+        var r = (Rectangle)selection.GetValue(form);
+        var screen = Screen.FromPoint(form.PointToScreen(new Point(r.Left + r.Width / 2, r.Top + r.Height / 2))).Bounds;
+        var limits = Rectangle.Intersect(form.ClientRectangle, form.RectangleToClient(screen));
+        if (limits.IsEmpty) limits = form.ClientRectangle;
+        int position = Fit(settings.PanelPosition, 0, 3);
+        bool side = !settings.Circle && position >= 2;
+        int available = side ? limits.Height : limits.Width;
+        int cell = Math.Max(1, Math.Min(unit, (available - 42) / tools.Count));
+        int height = cell + 10;
+        if (settings.Circle)
+        {
+            tools.Arrange(new Rectangle(Fit(r.Right + 6, limits.Left, limits.Right - height),
+                Fit(r.Top - height / 2, limits.Top, limits.Bottom - height), height, height), cell);
+            actions.Hide();
+        }
+        else
+        {
+            int width = side ? height : tools.Count * cell + 10;
+            int dockHeight = side ? tools.Count * cell + 10 : height;
+            int left = limits.Left + (limits.Width - width) / 2;
+            int top = position == 1 ? limits.Top + 16 : limits.Bottom - dockHeight - 16;
+            if (side)
+            {
+                left = position == 2 ? limits.Left + 16 : limits.Right - width - 16;
+                top = limits.Top + (limits.Height - dockHeight) / 2;
+            }
+            tools.Arrange(new Rectangle(left, top, width, dockHeight), cell);
+            int active = entries.FindIndex(item => item.Tool != null && item.Tool == (string)tool.GetValue(form));
+            actions.Visible = active >= 0 && Bar.UsesSlider(entries[active].Tool);
+            if (actions.Visible)
+            {
+                int sliderWidth = Math.Min(limits.Width, 5 * cell);
+                int center = left + 5 + active * cell + cell / 2;
+                int sliderLeft = Fit(center - sliderWidth / 2, limits.Left, limits.Right - sliderWidth);
+                int sliderTop = position == 1 ? top + dockHeight + 8 : top - height - 8;
+                if (side)
+                {
+                    sliderLeft = position == 2 ? left + width + 8 : left - sliderWidth - 8;
+                    sliderTop = top + 5 + active * cell + cell / 2 - height / 2;
+                }
+                actions.Arrange(new Rectangle(Fit(sliderLeft, limits.Left, limits.Right - sliderWidth),
+                    Fit(sliderTop, limits.Top, limits.Bottom - height), sliderWidth, height), cell);
+            }
+        }
+        tools.Show();
+    }
+
+    void OpenCircle()
+    {
+        if (orbit.Visible || tools.Count == 0) return;
+        var point = new Point(tools.Left + tools.Width / 2, tools.Top + tools.Height / 2);
+        var screen = form.RectangleToClient(Screen.FromPoint(form.PointToScreen(point)).Bounds);
+        int diameter = Math.Min(unit * 285 / 34, Math.Min(screen.Width, screen.Height));
+        int rightSide = point.X - diameter / 7;
+        int leftSide = point.X - diameter + diameter / 7;
+        int left = rightSide + diameter <= screen.Right ? rightSide : leftSide;
+        orbit.Arrange(new Rectangle(Fit(left, screen.Left, screen.Right - diameter),
+            Fit(point.Y - diameter / 2, screen.Top, screen.Bottom - diameter), diameter, diameter),
+            Math.Max(1, Math.Min(unit * 38 / 34, diameter * 38 / 285)));
+        orbit.Open();
+        orbit.BringToFront();
+    }
+
+    public bool Wheel(Point point, int delta)
+    {
+        if (!orbit.Visible || !orbit.ContainsPoint(new Point(point.X - orbit.Left, point.Y - orbit.Top)) || delta == 0) return false;
+        orbit.Rotate(delta);
+        return true;
+    }
+
+    public bool CloseCircle()
+    {
+        if (!orbit.Visible) return false;
+        orbit.Hide();
+        return true;
+    }
+
+    public void Dispose()
+    {
+        if (penOptions != null) penOptions.Dispose();
+        if (captureMenu != null) captureMenu.Dispose();
+        orbit.Dispose();
+        tools.Dispose();
+        actions.Dispose();
+    }
+
+    sealed class Bar : Control
+    {
+#if SMOOTH_WHEEL_PREVIEW
+        const bool SmoothWheel = true;
+#else
+        static readonly bool SmoothWheel = false;
+#endif
+        const int OpenDurationMilliseconds = 400;
+        const int CloseDurationMilliseconds = 180;
+        readonly QuickAccessOverlay owner;
+        readonly List<Item> items;
+        bool vertical;
+        readonly bool round;
+        readonly Timer animation = new Timer { Interval = 15 };
+        readonly Stopwatch elapsed = new Stopwatch();
+        readonly Stopwatch opening = new Stopwatch();
+        readonly ToolTip tip = new ToolTip { InitialDelay = 350 };
+        readonly Font centerLabelFont;
+        int cell, hover = -1;
+        readonly Stopwatch hoverClock = new Stopwatch();
+        int outgoing = -1;
+        string lastHoveredTool;
+        string slidingTool;
+        double hoverProgress = 1;
+        double angle, from, target;
+        double reveal = 1, revealFrom, revealTarget = 1;
+        bool sliding;
+        public int Count { get { return items.Count; } }
+
+        public Bar(QuickAccessOverlay owner, List<Item> items, bool vertical, bool round)
+        {
+            this.owner = owner;
+            this.items = items;
+            this.vertical = vertical;
+            this.round = round;
+            AccessibleName = round ? "Круговое меню" : vertical ? "Инструменты" : "Действия и толщина пера";
+            Font = owner.form.Font;
+            if (round) centerLabelFont = new Font(Font, FontStyle.Bold);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint, true);
+            Visible = false;
+            animation.Tick += delegate {
+                double progress = Math.Min(1, elapsed.Elapsed.TotalMilliseconds / 700);
+                if (elapsed.IsRunning) angle = from + (target - from) * Ease(progress);
+                double transition = Math.Min(1, opening.Elapsed.TotalMilliseconds /
+                    (revealTarget == 0 ? (SmoothWheel ? 240 : CloseDurationMilliseconds) : OpenDurationMilliseconds));
+                if (opening.IsRunning)
+                    reveal = revealFrom + (revealTarget - revealFrom) * transition * transition * (3 - 2 * transition);
+                if (hoverClock.IsRunning)
+                {
+                    hoverProgress = Math.Min(1, hoverClock.Elapsed.TotalMilliseconds / 180);
+                    if (hoverProgress >= 1) hoverClock.Reset();
+                }
+                Invalidate();
+                if (progress >= 1) elapsed.Reset();
+                if (opening.IsRunning && transition >= 1)
+                {
+                    opening.Reset();
+                    if (revealTarget == 0) Hide();
+                }
+                if (!opening.IsRunning && !elapsed.IsRunning && !hoverClock.IsRunning) animation.Stop();
+            };
+        }
+
+        static double Ease(double value) { return 1 - Math.Pow(1 - value, 3); }
+
+        public void Open()
+        {
+            reveal = 0;
+            Show();
+            AnimateReveal(1);
+        }
+
+
+        void AnimateReveal(double destination)
+        {
+            revealTarget = destination;
+            if (!SystemInformation.IsMenuAnimationEnabled)
+            {
+                reveal = destination;
+                if (destination == 0) Hide();
+                else Invalidate();
+                return;
+            }
+            revealFrom = reveal;
+            opening.Restart();
+            animation.Start();
+        }
+
+        public void Arrange(Rectangle bounds, int size)
+        {
+            if (ReferenceEquals(this, owner.tools))
+                vertical = owner.settings.Circle || owner.settings.PanelPosition >= 2;
+            cell = size;
+            if (Bounds != bounds) Bounds = bounds;
+        }
+
+        public bool ContainsPoint(Point point)
+        {
+            if (!ClientRectangle.Contains(point)) return false;
+            if (!round) return true;
+            double x = (point.X - Width / 2.0) / (Width / 2.0);
+            double y = (point.Y - Height / 2.0) / (Height / 2.0);
+            return x * x + y * y <= 1;
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (round && message.Msg == 0x84)
+            {
+                long xy = message.LParam.ToInt64();
+                if (!ContainsPoint(PointToClient(new Point((short)xy, (short)(xy >> 16)))))
+                {
+                    message.Result = new IntPtr(-1);
+                    return;
+                }
+            }
+            base.WndProc(ref message);
+        }
+
+        public void Rotate(int delta)
+        {
+            from = angle;
+            target += Math.Sign(delta) * 360.0 / Math.Max(3, Count);
+            elapsed.Restart();
+            animation.Start();
+        }
+
+        Rectangle ItemBounds(int index)
+        {
+            if (!round) return new Rectangle(5 + (vertical ? 0 : index * cell),
+                5 + (vertical ? index * cell : 0), cell, cell);
+            double radians = (angle - 90 + index * 360.0 / Count) * Math.PI / 180;
+            double radius = Width * .40 - (int)(Width * (SmoothWheel ? .40 : .10) * (1 - reveal)) * .80;
+            return new Rectangle((int)((Width - cell) / 2.0 + Math.Cos(radians) * radius),
+                (int)((Height - cell) / 2.0 + Math.Sin(radians) * radius), cell, cell);
+        }
+
+        int Hit(Point point)
+        {
+            if (round)
+            {
+                double dx = point.X - Width / 2.0, dy = point.Y - Height / 2.0;
+                double distance = Math.Sqrt(dx * dx + dy * dy);
+                int inset = (int)(Width * (SmoothWheel ? .40 : .10) * (1 - reveal));
+                double radius = (Width - 1) / 2.0 - inset;
+                if (reveal < .3 || distance < radius * .60 || distance > radius) return -1;
+                double degrees = Math.Atan2(dy, dx) * 180 / Math.PI + 90 - angle;
+                int index = (int)Math.Floor(degrees * Count / 360 + .5);
+                return (index % Count + Count) % Count;
+            }
+            for (int i = 0; i < Count; i++) if (ItemBounds(i).Contains(point)) return i;
+            return -1;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (sliding) { SetSliderValue(e.X); return; }
+            if (round && revealTarget == 0) AnimateReveal(1);
+            int next = Hit(e.Location);
+            if (next != hover)
+            {
+                ChangeHover(next);
+                Invalidate();
+            }
+            if (!round && !owner.settings.Circle)
+            {
+                string label = hover >= 0 ? items[hover].Name : "";
+                if (hover >= 0 && items[hover].Icon == "pen") label += " · ПКМ — сглаживание";
+                if (SliderArea.Contains(e.Location))
+                {
+                    if (SliderTool == CaptureBlur.ToolName) label = "Сила размытия";
+                    else if (SliderTool == CaptureMarker.ToolName) label = "Толщина маркера";
+                    else label = "Толщина пера";
+                }
+                if (tip.GetToolTip(this) != label) tip.SetToolTip(this, label);
+            }
+            if (hover >= 0 && items[hover].Icon == "circle") owner.OpenCircle();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            ChangeHover(-1);
+            Invalidate();
+            if (round && !sliding && !ContainsPoint(PointToClient(Cursor.Position))) AnimateReveal(0);
+            base.OnMouseLeave(e);
+        }
+
+        void ChangeHover(int next)
+        {
+            if (hover == next) return;
+            outgoing = hover;
+            hover = next;
+            if (round && next >= 0) lastHoveredTool = items[next].Tool ?? "";
+            if (round && Visible && SystemInformation.IsMenuAnimationEnabled)
+            {
+                hoverProgress = 0;
+                hoverClock.Restart();
+                animation.Start();
+            }
+            else hoverProgress = 1;
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                int item = Hit(e.Location);
+                if (item >= 0 && items[item].Icon == "pen")
+                    owner.ShowPenSmoothing(PointToScreen(e.Location));
+                return;
+            }
+            if (e.Button != MouseButtons.Left) return;
+            if (ColorSwatch.Contains(e.Location))
+            {
+                owner.entries.Find(item => item.Icon == "color").Invoke();
+                Invalidate();
+                owner.tools.Invalidate();
+                return;
+            }
+            if (SliderArea.Contains(e.Location))
+            {
+                owner.commitText();
+                slidingTool = SliderTool;
+                Capture = true;
+                sliding = true;
+                SetSliderValue(e.X);
+                return;
+            }
+            int index = Hit(e.Location);
+            if (index < 0) return;
+            owner.commitText();
+            if (round) Hide();
+            items[index].Invoke();
+            if (!owner.form.IsDisposed)
+            {
+                owner.Sync();
+                owner.tools.Invalidate();
+                owner.orbit.Invalidate();
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            if (!sliding) return;
+            FinishSliding();
+            Capture = false;
+            if (round && !ContainsPoint(e.Location)) AnimateReveal(0);
+        }
+
+        protected override void OnMouseCaptureChanged(EventArgs e)
+        {
+            if (!Capture) FinishSliding();
+            base.OnMouseCaptureChanged(e);
+        }
+
+        void FinishSliding()
+        {
+            if (!sliding) return;
+            sliding = false;
+            if (slidingTool == CaptureBlur.ToolName) owner.history.Record();
+        }
+
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            if (!Visible)
+            {
+                animation.Stop();
+                hoverClock.Reset();
+                hover = outgoing = -1;
+                lastHoveredTool = null;
+                hoverProgress = 1;
+                opening.Reset();
+                elapsed.Reset();
+                target = angle;
+            }
+            base.OnVisibleChanged(e);
+        }
+
+        void SetSliderValue(int x)
+        {
+            var track = SliderTrack;
+            double fraction = (x - track.Left) / (double)Math.Max(1, track.Width);
+            int value = 1 + Fit((int)Math.Round(fraction * 11), 0, 11);
+            if (SliderTool == CaptureBlur.ToolName) owner.painter.BlurStrength = value;
+            else owner.stroke.SetValue(owner.form, value);
+            Invalidate();
+        }
+
+        string SliderTool
+        {
+            get {
+                if (sliding) return slidingTool;
+                string activeTool = (string)owner.tool.GetValue(owner.form);
+                if (!round) return activeTool;
+                if (hover >= 0) return items[hover].Tool;
+                return UsesSlider(lastHoveredTool) ? lastHoveredTool : activeTool;
+            }
+        }
+
+        Rectangle SliderArea {
+            get {
+                if (vertical) return Rectangle.Empty;
+                if (!round) return Count == 0 ? Rectangle.FromLTRB(
+                    ColorSwatch.IsEmpty && !HasBlurIcon ? 0 : cell, 0, Width, Height) : Rectangle.Empty;
+                if (SmoothWheel && !UsesSlider(SliderTool)) return Rectangle.Empty;
+                int width = Math.Min(Width / 2, cell * 4);
+                return new Rectangle((Width - width) / 2, Height / 2 + 8, width, cell);
+            }
+        }
+
+        bool HasBlurIcon
+        {
+            get { return !round && !vertical && Count == 0 && SliderTool == CaptureBlur.ToolName; }
+        }
+
+        Rectangle ColorSwatch
+        {
+            get {
+                if (round || vertical || Count != 0 || cell < 16 || HasBlurIcon || SliderTool == CaptureMarker.ToolName ||
+                    !owner.entries.Exists(item => item.Icon == "color")) return Rectangle.Empty;
+                int size = cell / 2;
+                return new Rectangle((cell - size) / 2, (Height - size) / 2, size, size);
+            }
+        }
+
+        public static bool UsesSlider(string tool)
+        {
+            return tool == "Перо" || tool == "Линия" || tool == "Стрелка" || tool == "Рамка" ||
+                tool == CaptureBlur.ToolName || tool == CaptureMarker.ToolName;
+        }
+
+        Rectangle SliderTrack {
+            get {
+                var area = SliderArea;
+                int trailing = round ? 20 : 35;
+                return new Rectangle(area.Left + 14, area.Top + area.Height / 2,
+                    Math.Max(1, area.Width - 14 - trailing), 1);
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            bool light = owner.settings.Light;
+            var palette = new MintTheme(light);
+            var background = palette.Card;
+            var foreground = palette.Text;
+            var accent = palette.Accent;
+            int opacity = round ? (int)(255 * reveal) : 255;
+            var g = e.Graphics;
+            owner.painter.PaintBackdrop(g, Bounds);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (SmoothWheel && vertical && owner.settings.Circle)
+            {
+                var dot = ItemBounds(0);
+                dot.Inflate(-dot.Width / 5, -dot.Height / 5);
+                using (var brush = new SolidBrush(accent)) g.FillEllipse(brush, dot);
+                return;
+            }
+#if MINT_SQUARE_PREVIEW
+            if (vertical && owner.settings.Circle)
+            {
+                var button = new Rectangle(0, 0, Width - 1, Height - 1);
+                var mint = hover >= 0 ? Color.FromArgb(151, 246, 207) : Color.FromArgb(114, 237, 189);
+                using (var path = new GraphicsPath())
+                using (var brush = new SolidBrush(mint))
+                {
+                    AddRounded(path, button, 16);
+                    g.FillPath(brush, path);
+                }
+                DrawIcon(g, ItemBounds(0), "circle", Color.FromArgb(19, 56, 42));
+                return;
+            }
+#endif
+            using (var backgroundBrush = new SolidBrush(Color.FromArgb(opacity, background)))
+            using (var shape = new GraphicsPath())
+            {
+                int inset = round ? (int)(Width * (SmoothWheel ? .40 : .10) * (1 - reveal)) : 0;
+                var border = Rectangle.Inflate(new Rectangle(0, 0, Width - 1, Height - 1), -inset, -inset);
+                if (round) shape.AddEllipse(border); else AddRounded(shape, border, 16);
+                g.FillPath(backgroundBrush, shape);
+                using (var pen = new Pen(Color.FromArgb(opacity, palette.Border)))
+                {
+                    if (!round) g.DrawPath(pen, shape);
+                    else
+                    {
+                        var hub = Rectangle.Inflate(border, -border.Width / 5, -border.Height / 5);
+                        float sweep = 360f / Count;
+                        for (int i = 0; i < Count; i++)
+                        {
+                            var item = items[i];
+                    bool active = item.Tool != null && item.Tool == (string)owner.tool.GetValue(owner.form);
+                            double amount = active ? 1 : i == hover ? Ease(hoverProgress) :
+                                i == outgoing ? 1 - Ease(hoverProgress) : 0;
+                            float start = (float)(angle % 360) - 90 + (i - .5f) * sweep;
+                            using (var segment = new GraphicsPath())
+                            using (var fill = new SolidBrush(Color.FromArgb(opacity, Mix(background, accent, amount))))
+                            {
+                                segment.AddArc(border, start, sweep);
+                                segment.AddArc(hub, start + sweep, -sweep);
+                                segment.CloseFigure();
+                                g.FillPath(fill, segment);
+                                g.DrawPath(pen, segment);
+                            }
+                        }
+                        using (var fill = new SolidBrush(Color.FromArgb(opacity, palette.Surface)))
+                        {
+                            g.FillEllipse(fill, hub);
+                            g.DrawEllipse(pen, hub);
+                        }
+                    }
+                }
+            }
+            if (!ColorSwatch.IsEmpty)
+                MintSettingsInputs.DrawFrame(g, ColorSwatch, (Color)owner.color.GetValue(owner.form), palette.Border);
+            if (HasBlurIcon)
+                GeometricIcons.Draw(g, new Rectangle(3, (Height - cell) / 2, cell, cell), "blur", accent);
+            var currentTool = (string)owner.tool.GetValue(owner.form);
+            for (int i = 0; i < Count; i++)
+            {
+                var bounds = ItemBounds(i);
+                var item = items[i];
+                bool active = item.Tool != null && item.Tool == currentTool;
+                bool highlighted = active || hover == i;
+                if (!round && highlighted)
+                {
+                    var fill = active ? accent : palette.Hover;
+                    using (var brush = new SolidBrush(fill))
+                    using (var path = new GraphicsPath())
+                    {
+                        var button = Rectangle.Inflate(bounds, -1, -1);
+                        AddRounded(path, button, 9);
+                        g.FillPath(brush, path);
+                    }
+                }
+                var icon = item.Icon == "color" ? (Color)owner.color.GetValue(owner.form) :
+                    active || round && highlighted ? (light ? Color.White : Color.FromArgb(14, 36, 26)) : foreground;
+                if (round)
+                {
+                    double amount = active ? 1 : i == hover ? Ease(hoverProgress) : i == outgoing ? 1 - Ease(hoverProgress) : 0;
+                    icon = item.Icon == "color" ? (Color)owner.color.GetValue(owner.form) :
+                        Mix(foreground, light ? Color.White : Color.FromArgb(14, 36, 26), amount);
+                    GeometricIcons.Draw(g, bounds, item.Icon, Color.FromArgb(opacity, icon));
+                }
+                else if (owner.settings.SimplifiedPanel && !owner.settings.Circle)
+                    GeometricIcons.DrawSimplifiedTool(g, bounds, item.Icon, Color.FromArgb(opacity, icon));
+                else GeometricIcons.Draw(g, bounds, item.Icon, Color.FromArgb(opacity, icon));
+            }
+            if (!SliderArea.IsEmpty && (!round || reveal > .3))
+            {
+                bool blur = SliderTool == CaptureBlur.ToolName;
+                int value = blur ? owner.painter.BlurStrength : (int)owner.stroke.GetValue(owner.form);
+                var slider = SliderTrack;
+                int y = slider.Top;
+                int end = slider.Right;
+                int x = slider.Left + slider.Width * Fit(value - 1, 0, 11) / 11;
+                using (var track = new Pen(Color.FromArgb(opacity * 90 / 255, foreground), 2)) g.DrawLine(track, slider.Left, y, end, y);
+                using (var track = new Pen(Color.FromArgb(opacity, accent), 2)) g.DrawLine(track, slider.Left, y, x, y);
+                using (var brush = new SolidBrush(Color.FromArgb(opacity, accent))) g.FillEllipse(brush, x - 4, y - 4, 8, 8);
+                if (!round || blur) DrawCaption(g, value.ToString(),
+                    new Rectangle(end + 4, y - Font.Height / 2, 26, Font.Height), foreground, true);
+            }
+            if (round && reveal > .3)
+            {
+                string previewTool = SliderArea.IsEmpty ? currentTool : SliderTool;
+                int previewIndex = hover >= 0 ? hover : items.FindIndex(item => item.Tool != null && item.Tool == previewTool);
+#if WHEEL_LOGO_PREVIEW
+                if (previewIndex < 0 && SliderArea.IsEmpty)
+                {
+                    int size = Width / 4;
+                    using (var attributes = new System.Drawing.Imaging.ImageAttributes())
+                    {
+                        var alpha = new System.Drawing.Imaging.ColorMatrix { Matrix33 = opacity / 255f };
+                        attributes.SetColorMatrix(alpha);
+                        var logo = AppBrand.Logo;
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(logo, new Rectangle((Width - size) / 2, (Height - size) / 2, size, size),
+                            0, 0, logo.Width, logo.Height, GraphicsUnit.Pixel, attributes);
+                    }
+                }
+#endif
+                if (previewIndex >= 0)
+                {
+                    var item = items[previewIndex];
+                    double progress = Ease(hoverProgress);
+                    int size = (int)(cell * 1.9 * (.90 + .10 * progress));
+                    int labelHeight = centerLabelFont.Height + 3;
+                    int labelTop = Height / 2 + Math.Max(2, cell / 10);
+                    if (!SliderArea.IsEmpty) labelTop = Math.Min(labelTop, SliderTrack.Top - labelHeight - 6);
+                    int labelWidth = Width * 56 / 100;
+                    var label = new Rectangle((Width - labelWidth) / 2, labelTop, labelWidth, labelHeight);
+                    var preview = new Rectangle((Width - size) / 2, labelTop - 4 - size * 78 / 100, size, size);
+                    int previewOpacity = (int)(opacity * (.35 + .65 * progress));
+                    var tint = item.Icon == "color" ? (Color)owner.color.GetValue(owner.form) : accent;
+                    GeometricIcons.Draw(g, preview, item.Icon, Color.FromArgb(previewOpacity, tint));
+                    DrawCaption(g, item.Name, label, foreground, true, centerLabelFont, previewOpacity);
+                }
+            }
+        }
+
+        void DrawCaption(Graphics graphics, string text, Rectangle bounds, Color color, bool centered,
+            Font font = null, int? opacity = null)
+        {
+            int alpha = opacity ?? (round ? (int)(255 * reveal) : 255);
+            using (var brush = new SolidBrush(Color.FromArgb(alpha, color)))
+            using (var layout = new StringFormat {
+                Alignment = centered ? StringAlignment.Center : StringAlignment.Near,
+                LineAlignment = StringAlignment.Center,
+                FormatFlags = StringFormatFlags.NoWrap,
+                Trimming = StringTrimming.EllipsisCharacter
+            })
+                graphics.DrawString(text, font ?? Font, brush, bounds, layout);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                animation.Dispose();
+                tip.Dispose();
+                if (centerLabelFont != null) centerLabelFont.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    public static void DrawCorners(Graphics graphics, Rectangle bounds, Color color)
+    {
+        int arm = Math.Min(14, Math.Min(bounds.Width, bounds.Height) / 3);
+        if (arm == 0) return;
+        using (var pen = new Pen(color, 3))
+        {
+            graphics.DrawLines(pen, new[] { new Point(bounds.Left, bounds.Top + arm), bounds.Location, new Point(bounds.Left + arm, bounds.Top) });
+            graphics.DrawLines(pen, new[] { new Point(bounds.Right - arm, bounds.Top), new Point(bounds.Right, bounds.Top), new Point(bounds.Right, bounds.Top + arm) });
+            graphics.DrawLines(pen, new[] { new Point(bounds.Right, bounds.Bottom - arm), new Point(bounds.Right, bounds.Bottom), new Point(bounds.Right - arm, bounds.Bottom) });
+            graphics.DrawLines(pen, new[] { new Point(bounds.Left + arm, bounds.Bottom), new Point(bounds.Left, bounds.Bottom), new Point(bounds.Left, bounds.Bottom - arm) });
+        }
+    }
+
+    public static void AddRounded(GraphicsPath path, Rectangle r, int diameter)
+    {
+        diameter = Math.Min(diameter, Math.Min(r.Width, r.Height));
+        path.AddArc(r.Left, r.Top, diameter, diameter, 180, 90);
+        path.AddArc(r.Right - diameter, r.Top, diameter, diameter, 270, 90);
+        path.AddArc(r.Right - diameter, r.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(r.Left, r.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+    }
+
+    static Color Mix(Color a, Color b, double amount)
+    {
+        return Color.FromArgb((int)(a.R + (b.R - a.R) * amount),
+            (int)(a.G + (b.G - a.G) * amount), (int)(a.B + (b.B - a.B) * amount));
+    }
+
+    public static void DrawIcon(Graphics g, Rectangle r, string name, Color color, float proportion = .54f)
+    {
+        var state = g.Save();
+        float scale = Math.Min(r.Width, r.Height) * proportion / 20;
+        g.TranslateTransform(r.X + (r.Width - 20 * scale) / 2, r.Y + (r.Height - 20 * scale) / 2);
+        g.ScaleTransform(scale, scale);
+        using (var pen = new Pen(color, 1.7f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+        {
+            switch (name)
+            {
+                case "capture-corners":
+                    Lines(g, pen, 2,7,2,2,7,2); Lines(g, pen, 13,2,18,2,18,7);
+                    Lines(g, pen, 18,13,18,18,13,18); Lines(g, pen, 7,18,2,18,2,13);
+                    g.DrawEllipse(pen, 7.5f, 7.5f, 5, 5); break;
+                case "preferences":
+                    g.DrawLine(pen, 2, 6, 11, 6); g.DrawLine(pen, 15, 6, 18, 6);
+                    g.DrawEllipse(pen, 11, 4, 4, 4);
+                    g.DrawLine(pen, 2, 14, 5, 14); g.DrawLine(pen, 9, 14, 18, 14);
+                    g.DrawEllipse(pen, 5, 12, 4, 4); break;
+                case "about-document":
+                    Lines(g, pen, 4,2,12,2,16,6,16,18,4,18,4,2); Lines(g, pen, 12,2,12,6,16,6);
+                    g.DrawLine(pen, 10, 10, 10, 10.1f); g.DrawLine(pen, 10, 13, 10, 15); break;
+                case "help-bubble":
+                    Lines(g, pen, 5,15,2,18,2,3,18,3,18,15,5,15);
+                    g.DrawBezier(pen, 7.5f, 7.2f, 7.5f, 4.4f, 14.5f, 5.4f, 10, 9);
+                    g.DrawLine(pen, 10, 12, 10, 12.1f); break;
+                case "update-download":
+                    Lines(g, pen, 3,13,3,17,17,17,17,13);
+                    g.DrawLine(pen, 10, 2, 10, 12); Lines(g, pen, 6,8,10,12,14,8); break;
+                case "exit-door":
+                    Lines(g, pen, 9,3,3,3,3,17,9,17);
+                    g.DrawLine(pen, 7, 10, 18, 10); Lines(g, pen, 14,6,18,10,14,14); break;
+                case "clear-markup":
+                    Lines(g, pen, 2,13,12,3,18,9,10,17,6,17,2,13);
+                    g.DrawLine(pen, 7, 8, 13, 14); g.DrawLine(pen, 10, 17, 18, 17); break;
+                case "move":
+                    g.DrawLine(pen, 10, 2, 10, 18); g.DrawLine(pen, 2, 10, 18, 10);
+                    Lines(g, pen, 7,5,10,2,13,5); Lines(g, pen, 7,15,10,18,13,15);
+                    Lines(g, pen, 5,7,2,10,5,13); Lines(g, pen, 15,7,18,10,15,13); break;
+                case "pen": Lines(g,pen,3,17,4,12,14,2,18,6,8,16,3,17); g.DrawLine(pen,12,4,16,8); break;
+                case "line": g.DrawLine(pen,3,17,17,3); break;
+                case "arrow": Lines(g,pen,3,17,17,3,10,3); g.DrawLine(pen,17,3,17,10); break;
+                case "box": g.DrawRectangle(pen,3,4,14,12); break;
+                case "folder": Lines(g,pen,2,6,2,4,8,4,10,6,18,6,18,16,2,16,2,6); break;
+                case "text": Lines(g,pen,3,6,3,3,17,3,17,6); g.DrawLine(pen,10,3,10,17); g.DrawLine(pen,7,17,13,17); break;
+                case "circle": g.DrawEllipse(pen,2,2,16,16); g.DrawEllipse(pen,7,7,6,6); break;
+                case "color": using (var brush = new SolidBrush(color)) g.FillEllipse(brush,3,3,14,14); break;
+                case "undo": Lines(g,pen,7,3,2,8,7,12); g.DrawBezier(pen,2,8,17,4,22,17,10,17); break;
+                case "copy": g.DrawRectangle(pen,7,7,10,10); Lines(g,pen,13,4,13,2,2,2,2,13,4,13); break;
+                case "save": Lines(g,pen,3,2,14,2,17,5,17,18,3,18,3,2); g.DrawRectangle(pen,6,11,8,7); Lines(g,pen,6,2,6,7,13,7,13,2); break;
+                case "reset": g.DrawArc(pen,3,3,14,14,220,305); Lines(g,pen,2,3,2,9,8,9); break;
+                case "close": g.DrawLine(pen,4,4,16,16); g.DrawLine(pen,4,16,16,4); break;
+                case "settings": g.DrawLine(pen,3,5,17,5);g.DrawLine(pen,3,10,17,10);g.DrawLine(pen,3,15,17,15);
+                    g.DrawLine(pen,7,3,7,7);g.DrawLine(pen,13,8,13,12);g.DrawLine(pen,8,13,8,17);break;
+                case "info": g.DrawEllipse(pen,2,2,16,16);g.DrawLine(pen,10,9,10,14);g.DrawLine(pen,10,6,10,6.1f);break;
+                case "help": g.DrawEllipse(pen,2,2,16,16);g.DrawBezier(pen,7,8,7,3,15,6,11,9);
+                    g.DrawLine(pen,11,9,10,11);g.DrawLine(pen,10,14,10,14.1f);break;
+            }
+        }
+        g.Restore(state);
+    }
+
+    static void Lines(Graphics g, Pen pen, params int[] xy)
+    {
+        var points = new Point[xy.Length / 2];
+        for (int i = 0; i < points.Length; i++) points[i] = new Point(xy[i * 2], xy[i * 2 + 1]);
+        g.DrawLines(pen, points);
+    }
+}
